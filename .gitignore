@@ -1,0 +1,16 @@
+# secrets — never commit
+config.py
+.env
+
+# data and output
+*.db
+hrp_crm.db
+reports/
+logs/
+crm_fields*.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
