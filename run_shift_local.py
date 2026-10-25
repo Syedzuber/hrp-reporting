@@ -60,15 +60,22 @@ def main():
     print(f"Config: {settings.summary()}")
     print(f"Window ends: {when:%a %d %b %Y %H:%M %Z}")
 
+    sync_ok = True
     if args.no_sync:
+        # No sync, so no fact to pass: the PDF's time-based check decides the banner.
         print("Skipping sync — numbers will be as stale as the snapshot.")
     else:
         import crm_sync
         days = args.days or settings.SYNC_DAYS
         print(f"Syncing Zoho, {days} days. This is the slow part.")
-        crm_sync.sync(days=days)
+        try:
+            crm_sync.sync(days=days)
+        except Exception as exc:
+            sync_ok = False
+            print(f"\n*** CRM SYNC FAILED: {exc}\n*** Building from the previous snapshot; "
+                  f"the PDF will say so.\n")
 
-    rep = shift.build_shift_data(settings.DB_PATH, now=when)
+    rep = shift.build_shift_data(settings.DB_PATH, now=when, sync_ok=sync_ok)
 
     w = rep["windows"][0]
     print()

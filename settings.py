@@ -81,26 +81,29 @@ LADDER_SINCE = _get("LADDER_SINCE", "2026-01-01")
 
 # ── Schedules (IST). Change these to move a report's time. ────────────
 MORNING_AT = _get("MORNING_AT", "08:00")
-# The shift report runs twice a day. Each run covers the interval since the
-# previous one, so the two together tile the day with no gap and no overlap.
-SHIFT_TIMES = _get("SHIFT_TIMES", ["11:00", "20:00"], list)
-# By default a shift window starts at the previous boundary, so the 20:00 run
-# would cover 11:00-20:00. That is not the working day. This overrides the
-# start for a given run time: "20:00=09:00" makes the day-end report cover
-# 09:00 to 20:00 regardless of when the earlier report ran.
-#
-# NOTE this deliberately creates an overlap: the 11:00 report covers 20:00
-# yesterday to 11:00 today, so 09:00-11:00 appears in both editions. That is
-# the price of the evening report describing a whole working day, and it is
-# stated on the face of the PDF.
+# The shift report runs once, at the end of the working day. It used to run at
+# 11:00 too, but that edition covered 20:00 to 11:00 — mostly hours in which
+# nobody works — so the morning slot is now the day-start report instead.
+SHIFT_TIMES = _get("SHIFT_TIMES", ["20:00"], list)
+# By default a shift window starts at the previous boundary, which with a single
+# run time is 20:00 the day before: a 24-hour window. This overrides the start
+# for a given run time, so "20:00=09:00" makes the day-end report cover the
+# working day, 09:00 to 20:00.
 SHIFT_WINDOW_STARTS = _get("SHIFT_WINDOW_STARTS", ["20:00=09:00"], list)
+
+# The forward-looking report: what has to happen today. See hrp_report/daystart.py.
+DAYSTART_AT = _get("DAYSTART_AT", "09:00")
 
 EVENING_AT = _get("EVENING_AT", "18:30")   # legacy single-run report
 HEALTHCHECK_AT = _get("HEALTHCHECK_AT", "21:00")
 TIMEZONE = _get("TIMEZONE", "Asia/Kolkata")
 
-MORNING_ENABLED = _get("MORNING_ENABLED", True, bool)
+# Off by default: superseded by the day-start report, and it has no stale-data
+# banner (see hrp_report/daily_pdf_email.py). Off in code so that a fresh
+# deploy without the variable cannot bring it back.
+MORNING_ENABLED = _get("MORNING_ENABLED", False, bool)
 SHIFT_ENABLED = _get("SHIFT_ENABLED", True, bool)
+DAYSTART_ENABLED = _get("DAYSTART_ENABLED", True, bool)
 EVENING_ENABLED = _get("EVENING_ENABLED", False, bool)   # superseded by SHIFT
 HEALTHCHECK_ENABLED = _get("HEALTHCHECK_ENABLED", True, bool)
 
@@ -114,7 +117,7 @@ def summary() -> str:
         f"transport {MAIL_TRANSPORT} | from {SMTP_FROM or 'MISSING'} | "
         f"{len(RECIPIENTS)} recipients | alerts to {len(ALERT_TO) or 'derived'} | "
         f"db {DB_PATH} | sync {SYNC_DAYS}d | ladder since {LADDER_SINCE} | "
-        f"morning {MORNING_AT} | shifts {','.join(SHIFT_TIMES)} | "
+        f"morning {MORNING_AT} | day start {DAYSTART_AT} | shifts {','.join(SHIFT_TIMES)} | "
         f"window starts {','.join(SHIFT_WINDOW_STARTS) or 'default'} | "
         f"health {HEALTHCHECK_AT} | {TIMEZONE}"
     )

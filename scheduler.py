@@ -1,13 +1,18 @@
 """
 scheduler.py — the Railway entrypoint.
 
-One always-on process holding all three jobs, replacing Windows Task Scheduler.
+One always-on process holding every job, replacing Windows Task Scheduler.
 Times come from settings (environment variables on Railway), so changing a
 report's time is a variable change and a restart, not a code edit.
 
-    Morning CEO Report    MORNING_AT      default 08:00 IST
-    End of Day Report     EVENING_AT      default 18:30 IST
+    Morning CEO Report    MORNING_AT      default 08:00 IST  (superseded, off by default)
+    Day Start Report      DAYSTART_AT     default 09:00 IST
+    Shift Report          SHIFT_TIMES     default 20:00 IST
+    End of Day Report     EVENING_AT      default 18:30 IST  (legacy, off by default)
     Report Healthcheck    HEALTHCHECK_AT  default 21:00 IST
+
+A job added here must also be added to jobruns.scheduled_jobs(), or the
+healthcheck will not watch it.
 
 Also serves a tiny HTTP endpoint on $PORT so Railway sees a live service and
 you can check status from a browser.
@@ -102,6 +107,12 @@ def job_shift():
         raise RuntimeError("Shift report was not emailed — see the mail error above.")
 
 
+def job_daystart():
+    from hrp_report.daystart import send_daystart_report
+    if not send_daystart_report():  # syncs internally
+        raise RuntimeError("Day-start report was not emailed — see the mail error above.")
+
+
 def job_healthcheck():
     from hrp_report.healthcheck import run_check
     state = run_check()
@@ -127,6 +138,7 @@ def status() -> dict:
         "timezone": settings.TIMEZONE,
         "schedule": {
             "morning": settings.MORNING_AT if settings.MORNING_ENABLED else "disabled",
+            "daystart": settings.DAYSTART_AT if settings.DAYSTART_ENABLED else "disabled",
             "shifts": settings.SHIFT_TIMES if settings.SHIFT_ENABLED else "disabled",
             "evening_legacy": settings.EVENING_AT if settings.EVENING_ENABLED else "disabled",
             "healthcheck": settings.HEALTHCHECK_AT if settings.HEALTHCHECK_ENABLED else "disabled",
@@ -172,6 +184,12 @@ def main():
                       id="morning", misfire_grace_time=3600, coalesce=True)
         log.info("Morning report scheduled %02d:%02d %s", h, m, settings.TIMEZONE)
 
+    if settings.DAYSTART_ENABLED:
+        h, m = _hhmm(settings.DAYSTART_AT, "09:00")
+        sched.add_job(_wrap("daystart", job_daystart), "cron", hour=h, minute=m,
+                      id="daystart", misfire_grace_time=3600, coalesce=True)
+        log.info("Day-start report scheduled %02d:%02d %s", h, m, settings.TIMEZONE)
+
     if settings.SHIFT_ENABLED:
         for raw in settings.SHIFT_TIMES:
             h, m = _hhmm(raw, "20:00")
@@ -194,12 +212,14 @@ def main():
 
     sched.start()
 
-    # Run any job immediately on boot by setting RUN_ON_BOOT=morning|evening|healthcheck
+    # Run any job immediately on boot by setting
+    # RUN_ON_BOOT=morning|daystart|shift|evening|healthcheck
     boot = (os.environ.get("RUN_ON_BOOT") or "").strip().lower()
-    if boot in ("morning", "evening", "healthcheck", "shift"):
+    if boot in ("morning", "daystart", "evening", "healthcheck", "shift"):
         log.info("RUN_ON_BOOT=%s — running once now.", boot)
         threading.Thread(
             target=_wrap(boot, {"morning": job_morning,
+                                "daystart": job_daystart,
                                 "evening": job_evening,
                                 "shift": job_shift,
                                 "healthcheck": job_healthcheck}[boot]),

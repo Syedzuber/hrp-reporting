@@ -1,12 +1,20 @@
 """
 hrp_report.daily_pdf_email — build the PDF and email it at 08:00 IST.
 
+SUPERSEDED, and off by default (MORNING_ENABLED). The 09:00 day-start report
+(hrp_report.daystart) replaces it, and it is disabled in production.
+
 Run standalone:      python -m hrp_report.daily_pdf_email
 Or from app.py:      from hrp_report.daily_pdf_email import send_daily_pdf
 
-Before building it refreshes the local snapshot with crm_sync so the numbers are
-current. If the sync fails the report is still produced from the last good
-snapshot, and the PDF says plainly how old that snapshot is.
+Before building it refreshes the local snapshot with crm_sync. If the sync
+fails the report is still produced from the last good snapshot, sent, and then
+SyncFailed is raised so the scheduler records the run as failed.
+
+KNOWN AND UNFIXED: this PDF has no stale-data banner. Unlike the shift and
+day-start reports, nothing on the page warns that its sync failed or that the
+snapshot is old; the snapshot time appears only in the notes at the foot. Left
+as is because the report is retired. Fix it before re-enabling.
 """
 
 from __future__ import annotations

@@ -108,6 +108,8 @@ def scheduled_jobs() -> list[tuple[str, time]]:
     out = []
     if settings.MORNING_ENABLED:
         out.append(("morning", _clock(settings.MORNING_AT, "08:00")))
+    if settings.DAYSTART_ENABLED:
+        out.append(("daystart", _clock(settings.DAYSTART_AT, "09:00")))
     if settings.SHIFT_ENABLED:
         for raw in settings.SHIFT_TIMES:
             t = _clock(raw, "20:00")

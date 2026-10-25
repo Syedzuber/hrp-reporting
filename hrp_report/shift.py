@@ -1,17 +1,13 @@
 """
-hrp_report.shift — the twice-daily interval report (11:00 and 20:00 IST).
+hrp_report.shift — the end-of-day interval report (20:00 IST).
 
-This supersedes the single evening edition. Each run covers the interval since
-the previous run, so the two together tile the whole day with no gap and no
-overlap:
+This supersedes the single evening edition. It runs once, at 20:00, and covers
+the working day, 09:00 to 20:00 (see SHIFT_WINDOW_STARTS). The comparison
+columns are the same window on the previous two days.
 
-    11:00 run   covers 20:00 yesterday  ->  11:00 today   (15 hours, overnight)
-    20:00 run   covers 11:00 today      ->  20:00 today   ( 9 hours, the shift)
-
-Because the two windows are different lengths, the comparison columns are the
-SAME window on the previous two days — never the other shift. Comparing a
-nine-hour working shift against a fifteen-hour overnight window would be
-meaningless.
+It used to run at 11:00 as well, covering 20:00 to 11:00. That edition was
+mostly hours in which nobody works and reported near-zero, so the morning slot
+is now hrp_report.daystart, which looks forward rather than back.
 
 Run standalone:   python -m hrp_report.shift
 """
@@ -77,6 +73,13 @@ DEAL_AGE_BUCKETS = [("0-7", 0, 7), ("8-15", 8, 15), ("16-30", 16, 30),
                     ("180+", 181, None)]
 DEAL_IDLE_DAYS = 14
 
+# A sync stamps sync_log with the moment it STARTED, so even freshly synced data
+# is a few minutes older than the end of the window it is reported against —
+# longer for a full SYNC_DAYS pull. Within this grace the snapshot counts as
+# current; beyond it the time-based stale banner fires. Shared with the
+# day-start report.
+SNAPSHOT_GRACE = timedelta(hours=1)
+
 # A sequential single-hue ramp, light to dark, because these are ordered stages
 # of the same failure rather than four unrelated categories. Lightness descends
 # monotonically, so the chart survives a monochrome printer.
@@ -101,7 +104,7 @@ def shift_boundaries():
             out.append(time(int(h), int(m)))
         except Exception:
             log.error("Bad shift time %r — ignored.", raw)
-    return sorted(out) or [time(11, 0), time(20, 0)]
+    return sorted(out) or [time(20, 0)]
 
 
 def _window_start_overrides():
@@ -126,8 +129,7 @@ def window_for(now: datetime):
 
     SHIFT_WINDOW_STARTS overrides that for a given run time. The day-end report
     is configured as 20:00=09:00 so it covers the working day rather than the
-    hours since the 11:00 report — which means 09:00-11:00 is reported twice,
-    once in each edition. The PDF says so.
+    full 24 hours since the previous 20:00 run.
     """
     overrides = _window_start_overrides()
     for (rh, rm), begin in overrides.items():
@@ -480,14 +482,30 @@ def deal_aging(deals, now: datetime):
     return {"stages": [(s, rows[s]) for s in order]}
 
 
+def ladder_since() -> datetime:
+    """LADDER_SINCE as an IST datetime — the start of the standing lead backlog."""
+    try:
+        y, m, d = (int(x) for x in str(settings.LADDER_SINCE).split("-")[:3])
+        return IST.localize(datetime(y, m, d))
+    except Exception:
+        log.error("Bad LADDER_SINCE %r — falling back to 1 Jan 2026.",
+                  settings.LADDER_SINCE)
+        return IST.localize(datetime(2026, 1, 1))
+
+
 def build_shift_data(db_path: str, now: datetime | None = None,
-                     start: datetime | None = None) -> dict:
+                     start: datetime | None = None, sync_ok: bool = True) -> dict:
     """Build the report payload.
 
     `start` overrides the computed window start, so a caller can ask for an
     arbitrary span — a whole day, say — rather than the scheduled shift window.
     The two comparison columns still shift back by one and two days, keeping
     like-for-like.
+
+    `sync_ok` is False when the sync for this run failed. The caller knows that
+    for certain, so it is passed in rather than inferred, and it raises the stale
+    banner however recent the previous snapshot is. Builds that did not try to
+    sync leave it True and rely on the time-based check in stale_message().
     """
     data = load_records(db_path)
     idx = _index(data)
@@ -501,13 +519,7 @@ def build_shift_data(db_path: str, now: datetime | None = None,
     for back in (1, 2):
         windows.append((start - timedelta(days=back), end - timedelta(days=back)))
 
-    try:
-        y, m, d = (int(x) for x in str(settings.LADDER_SINCE).split("-")[:3])
-        since = IST.localize(datetime(y, m, d))
-    except Exception:
-        log.error("Bad LADDER_SINCE %r — falling back to 1 Jan 2026.",
-                  settings.LADDER_SINCE)
-        since = IST.localize(datetime(2026, 1, 1))
+    since = ladder_since()
 
     return {
         "windows": [window_metrics(idx, s, e) for s, e in windows],
@@ -516,6 +528,7 @@ def build_shift_data(db_path: str, now: datetime | None = None,
         "deal_aging": deal_aging(data.get("Deals", []), now),
         "events_synced": len(data.get("Events", [])),
         "snapshot_at": snapshot_time(db_path),
+        "sync_ok": sync_ok,
         "generated_at": now,
     }
 
@@ -606,7 +619,9 @@ def _hdr(wins):
     return out
 
 
-def _table(rows, widths, flag_zero=True, bold_first_col=True):
+def _table(rows, widths, flag_zero=True, bold_first_col=True, total=True, numeric=True):
+    """`total` styles the last row as a totals row; `numeric` right-aligns every
+    column after the first. A list of records passes False for both."""
     t = Table(rows, colWidths=widths)
     last = len(rows) - 1
     cmds = [
@@ -615,11 +630,21 @@ def _table(rows, widths, flag_zero=True, bold_first_col=True):
         ("TEXTCOLOR", (0, 0), (-1, 0), MUTE),
         ("LINEBELOW", (0, 0), (-1, 0), 0.9, INK),
         ("FONTSIZE", (0, 1), (-1, -1), 8.6),
-        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+    ]
+    if numeric:
+        cmds.append(("ALIGN", (1, 0), (-1, -1), "RIGHT"))
+    cmds += [
         ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
-        ("LINEBELOW", (0, 1), (-1, last - 1), 0.4, LINE),
-        ("LINEABOVE", (0, last), (-1, last), 0.9, INK),
-        ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+    ]
+    if total:
+        cmds += [
+            ("LINEBELOW", (0, 1), (-1, last - 1), 0.4, LINE),
+            ("LINEABOVE", (0, last), (-1, last), 0.9, INK),
+            ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
+        ]
+    else:
+        cmds.append(("LINEBELOW", (0, 1), (-1, last), 0.4, LINE))
+    cmds += [
         ("TOPPADDING", (0, 0), (-1, -1), 3.5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
@@ -636,11 +661,10 @@ def _table(rows, widths, flag_zero=True, bold_first_col=True):
     return t
 
 
-def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power") -> str:
-    wins = rep["windows"]
-    w1 = wins[0]
-    gen = rep["generated_at"]
+# ── shared page furniture, also used by the day-start report ──────────
 
+def _styles():
+    """(stylesheet, h1, sub, sec, note) — the type scale every report uses."""
     st = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=st["Title"], fontName="Helvetica-Bold",
                         fontSize=17, leading=20, textColor=INK, alignment=TA_LEFT,
@@ -649,11 +673,70 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
     sec = ParagraphStyle("sec", parent=st["Normal"], fontName="Helvetica-Bold",
                          fontSize=10.5, leading=14, textColor=INK, spaceBefore=12, spaceAfter=4)
     note = ParagraphStyle("note", parent=st["Normal"], fontSize=7.8, leading=10.5, textColor=MUTE)
+    return st, h1, sub, sec, note
 
-    doc = SimpleDocTemplate(out_path, pagesize=A4,
-                            leftMargin=15 * mm, rightMargin=15 * mm,
-                            topMargin=13 * mm, bottomMargin=12 * mm,
-                            title=f"Shift Report — {company}", author=company)
+
+def _doc(out_path, title, company):
+    return SimpleDocTemplate(out_path, pagesize=A4,
+                             leftMargin=15 * mm, rightMargin=15 * mm,
+                             topMargin=13 * mm, bottomMargin=12 * mm,
+                             title=f"{title} — {company}", author=company)
+
+
+def _stale_banner(st, message):
+    """White-on-red banner for a snapshot too old to trust. `message` is markup."""
+    warn = ParagraphStyle("warn", parent=st["Normal"], fontSize=9, leading=12.5,
+                          textColor=colors.white, backColor=ZERO,
+                          borderPadding=7, spaceAfter=8)
+    return Paragraph(message, warn)
+
+
+def sync_failed_message(snap, missing: str) -> str:
+    """Banner text for a run whose own sync failed. Shared with the day-start."""
+    when = f"{snap:%d %b %H:%M IST}" if snap else "never — no sync has ever completed"
+    return (f"<b>THE CRM SYNC FOR THIS REPORT FAILED.</b> The figures below come from "
+            f"an earlier snapshot, taken {when}, not from data downloaded for this "
+            f"report. {missing}")
+
+
+def stale_message(snap, start, end, sync_ok=True) -> str | None:
+    """Banner markup when the figures cannot be trusted as current, else None.
+
+    Two independent routes, and either is enough:
+
+      * the fact: this run's own sync failed (sync_ok False). The job knows this
+        for certain, and it holds however recent the previous snapshot is — the
+        09:00 sync can succeed and the 20:00 one fail.
+      * the backstop: the snapshot is older than the END of the window, less
+        SNAPSHOT_GRACE. This covers builds that never tried to sync — the
+        --no-sync tools and any manual build — where there is no fact to pass.
+    """
+    if not sync_ok:
+        return sync_failed_message(
+            snap, "Anything logged since then is missing, so a low figure may mean "
+                  "missing data rather than no work.")
+    if snap is None:
+        return ("<b>THESE NUMBERS ARE NOT REAL.</b> No sync of the CRM data has ever "
+                "completed, so every figure below is empty, not zero.")
+    if snap < start:
+        return (f"<b>THESE NUMBERS ARE NOT REAL.</b> The CRM data was last refreshed "
+                f"{snap:%d %b %H:%M IST}, before this window even began. Every zero below "
+                f"means no data was downloaded, not that no work was done.")
+    if snap < end - SNAPSHOT_GRACE:
+        return (f"<b>THESE NUMBERS ARE INCOMPLETE.</b> The CRM data was last refreshed "
+                f"{snap:%d %b %H:%M IST}, partway through this window, which runs to "
+                f"{end:%H:%M}. Anything logged after that is missing, so the figures "
+                f"below understate the window.")
+    return None
+
+
+def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power") -> str:
+    wins = rep["windows"]
+    w1 = wins[0]
+    gen = rep["generated_at"]
+
+    st, h1, sub, sec, note = _styles()
+    doc = _doc(out_path, "Shift Report", company)
 
     label = "Overnight" if w1["hours"] > 12 else "Working shift"
     W = [66 * mm, 26 * mm, 26 * mm, 26 * mm]
@@ -662,21 +745,15 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
         Paragraph(
             f"{company} &nbsp;·&nbsp; <b>{w1['start']:%a %d %b %H:%M}</b> to "
             f"<b>{w1['end']:%H:%M}</b> ({w1['hours']:g} hours). The two columns beside it "
-            f"are the same window on the previous two days &mdash; not the other shift, "
-            f"which is a different length.", sub),
+            f"are the same window on the previous two days, so every comparison is like "
+            f"for like.", sub),
         Spacer(1, 8),
     ]
 
-    # staleness guard, same as before
     snap = rep.get("snapshot_at")
-    if snap and snap < w1["start"]:
-        warn = ParagraphStyle("warn", parent=st["Normal"], fontSize=9, leading=12.5,
-                              textColor=colors.white, backColor=ZERO,
-                              borderPadding=7, spaceAfter=8)
-        story.append(Paragraph(
-            f"<b>THESE NUMBERS ARE NOT REAL.</b> The CRM data was last refreshed "
-            f"{snap:%d %b %H:%M IST}, before this window even began. Every zero below "
-            f"means no data was downloaded, not that no work was done.", warn))
+    stale = stale_message(snap, w1["start"], w1["end"], rep.get("sync_ok", True))
+    if stale:
+        story.append(_stale_banner(st, stale))
 
     # headline
     rows = [_hdr(wins)]
@@ -823,11 +900,11 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
 
     story.append(Spacer(1, 10))
     story.append(Paragraph(
-        "<b>How to read this.</b> The two daily editions tile the day without gap or "
-        "overlap: the 11:00 report covers the overnight window since 20:00, and the 20:00 "
-        "report covers the working shift since 11:00. Because those windows differ in "
-        "length, they are never compared against each other — only against the same window "
-        "on earlier days. "
+        f"<b>How to read this.</b> This report is sent once a day, at the end of the "
+        f"working day, and covers {w1['start']:%H:%M} to {w1['end']:%H:%M}. Each column is "
+        f"that same window on a different day, so the columns compare like with like. "
+        f"What has to happen next is in the 09:00 Day Start report, which looks forward "
+        f"rather than back. "
         "<b>Where Calls made comes from.</b> It is counted from the Leads module, not "
         "the Calls module. A call is a lead whose last activity falls in this window and "
         "which carries a Latest Call Action — Missed, Interested, Call Back, Not "
@@ -871,6 +948,16 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
 
 # ── email ─────────────────────────────────────────────────────────────
 
+def _stale_for(rep):
+    w1 = rep["windows"][0]
+    return stale_message(rep.get("snapshot_at"), w1["start"], w1["end"],
+                         rep.get("sync_ok", True))
+
+
+def _strip_tags(markup):
+    return markup.replace("<b>", "").replace("</b>", "")
+
+
 def _body_text(rep):
     wins = rep["windows"]
     w1 = wins[0]
@@ -881,6 +968,11 @@ def _body_text(rep):
         "Compared with the same window on the previous two days.",
         "", f"{'Metric':28}{hdr}", "-" * 70,
     ]
+    # The same warning as the PDF banner: the email repeats the headline
+    # figures, and is often all anyone reads.
+    stale = _stale_for(rep)
+    if stale:
+        out[3:3] = ["", "WARNING: " + _strip_tags(stale)]
     for lbl, key in [("Calls made", "calls"),
                      ("...follow-up calls", "followups"),
                      ("...first contact", "first_contact"),
@@ -929,6 +1021,10 @@ def _body_html(rep):
         f'{"#9c2b28" if lad["counts"].get(k, 0) == 0 else "#1a3c5e"};">'
         f'{lad["counts"].get(k, 0):,}</td></tr>' for k in LADDER)
 
+    stale = _stale_for(rep)
+    warning = (f'\n    <p style="background:#9c2b28;color:#fff;padding:10px 12px;font-size:13px;'
+               f'margin:0 0 14px;">{stale}</p>' if stale else "")
+
     return f"""<!DOCTYPE html><html><body style="margin:0;padding:20px;background:#f0f4f8;font-family:Arial,Helvetica,sans-serif;">
 <div style="max-width:660px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #e2e5ea;">
   <div style="background:#16324f;padding:22px 26px;">
@@ -937,7 +1033,7 @@ def _body_html(rep):
       {config.COMPANY_NAME} &middot; {w1['start']:%a %d %b %H:%M} to {w1['end']:%H:%M} &middot; {w1['hours']:g} hours
     </p>
   </div>
-  <div style="padding:18px 22px;">
+  <div style="padding:18px 22px;">{warning}
     <table style="width:100%;border-collapse:collapse;">
       <tr><th style="text-align:left;font-size:11px;color:#888;padding:0 10px 6px;border-bottom:2px solid #16324f;">This window</th>{hdr}</tr>
       {row('Calls made', [w['calls'] for w in wins], True)}
@@ -967,31 +1063,53 @@ def _body_html(rep):
       The chart and the per-person breakdowns are in the attached PDF.
     </p>
     <p style="font-size:11px;color:#999;margin:10px 0 0;">
-      The 11:00 edition covers the overnight window since 20:00; the 20:00 edition covers
-      the working shift since 11:00. The two are never compared against each other, since
-      they are different lengths.
+      This report covers {w1['start']:%H:%M} to {w1['end']:%H:%M}, and each column is that
+      same window on a different day. What has to happen next is in the 09:00 Day Start
+      report.
     </p>
   </div>
 </div></body></html>"""
+
+
+def _refresh_snapshot(report: str) -> Exception | None:
+    """Sync before building. Returns None on success, or the error.
+
+    Never raises. A failed sync is logged loudly and the report is built from
+    the previous snapshot with sync_ok=False, so its banner says this run's sync
+    failed. The caller raises SyncFailed once the report has been sent.
+    """
+    try:
+        import crm_sync
+        crm_sync.sync(days=settings.SYNC_DAYS)
+        return None
+    except Exception as exc:
+        log.error("CRM SYNC FAILED (%s) — building the %s from the previous snapshot. "
+                  "It will still be sent; this run will be recorded as failed.", exc, report)
+        return exc
+
+
+def _mail_report(name, subject, text_body, html_body, pdf_path) -> str | None:
+    """Send one report to RECIPIENTS. Returns the PDF path, or None on failure."""
+    try:
+        send_mail(subject=subject, text_body=text_body, html_body=html_body,
+                  to=config.RECIPIENTS, attachment=pdf_path)
+        log.info("%s sent to %s", name, config.RECIPIENTS)
+        return pdf_path
+    except MailError as exc:
+        log.error("%s email failed: %s", name, exc)
+        return None
 
 
 def send_shift_report(now=None) -> str | None:
     """Sync, build and send. Returns the PDF path, or None if the email failed.
 
     A failed sync does not stop the report: it is built from the previous
-    snapshot, its stale banner says so, and it is sent. SyncFailed is raised
-    afterwards so the scheduler records the run as failed.
+    snapshot, its banner says this run's sync failed, and it is sent. SyncFailed
+    is raised afterwards so the scheduler records the run as failed.
     """
-    sync_error = None
-    try:
-        import crm_sync
-        crm_sync.sync(days=settings.SYNC_DAYS)
-    except Exception as exc:
-        sync_error = exc
-        log.error("CRM SYNC FAILED (%s) — building the shift report from the previous "
-                  "snapshot. It will still be sent; this run will be recorded as failed.", exc)
+    sync_error = _refresh_snapshot("shift report")
 
-    rep = build_shift_data(DB_PATH, now=now)
+    rep = build_shift_data(DB_PATH, now=now, sync_ok=sync_error is None)
     w1 = rep["windows"][0]
     tag = "overnight" if w1["hours"] > 12 else "shift"
 
@@ -1000,17 +1118,11 @@ def send_shift_report(now=None) -> str | None:
         OUT_DIR, f"HRP_Shift_{w1['end']:%Y-%m-%d_%H%M}_{tag}.pdf")
     build_pdf(rep, pdf_path, company=config.COMPANY_NAME)
 
-    try:
-        send_mail(
-            subject=(f"Shift Report {w1['start']:%H:%M}-{w1['end']:%H:%M} "
-                     f"- {w1['end']:%d %b %Y} | {config.COMPANY_NAME}"),
-            text_body=_body_text(rep), html_body=_body_html(rep),
-            to=config.RECIPIENTS, attachment=pdf_path)
-        log.info("Shift report sent to %s", config.RECIPIENTS)
-        sent = pdf_path
-    except MailError as exc:
-        log.error("Shift report email failed: %s", exc)
-        sent = None
+    sent = _mail_report(
+        "Shift report",
+        subject=(f"Shift Report {w1['start']:%H:%M}-{w1['end']:%H:%M} "
+                 f"- {w1['end']:%d %b %Y} | {config.COMPANY_NAME}"),
+        text_body=_body_text(rep), html_body=_body_html(rep), pdf_path=pdf_path)
 
     if sync_error is not None:
         raise SyncFailed("shift report", sync_error, bool(sent)) from sync_error

@@ -130,7 +130,13 @@ MODULES = {
             "id", "Event_Title", "Start_DateTime", "End_DateTime",
             "Owner", "What_Id", "Who_Id", "Created_Time", "Modified_Time",
             "Venue", "Description",
+            # Survey / Client Discussion picklist, added to Zoho in August 2026.
+            "Meeting_Type",
         ],
+        # Fields whose API name has not been confirmed against Zoho. If one
+        # makes a request fail it is dropped and the request retried, so a
+        # wrong name costs that field, not the whole module. Logged loudly.
+        "optional": ["Meeting_Type"],
     },
     # Proposals is a custom module (API name: Proposals). Proposal Date is
     # Date_1; the sender is a picklist, NOT the record owner.
@@ -220,11 +226,13 @@ LIST_MAX_PAGES = 250          # 50,000 records
 LIST_PER_PAGE = 200
 
 
-def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES):
+def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES,
+               optional=()):
     """Fallback: newest-first list endpoint, filtered in Python.
 
     Returns (records, complete). complete=False means we stopped on the page
     ceiling rather than because we ran past the window — i.e. truncated.
+    `optional` fields are dropped and the fetch retried if the request fails.
     """
     url = f"{config.ZOHO_CRM_BASE}/{module}"
     # Sorting on the field we filter on lets us stop early and correctly.
@@ -257,6 +265,11 @@ def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES)
             continue
         if r.status_code != 200:
             log.warning("List %s failed (%s): %s", module, r.status_code, r.text[:200])
+            requested = [f for f in optional if f in fields]
+            if requested:
+                _log_optional_retry(module, requested, "list")
+                return list_fetch(module, [f for f in fields if f not in requested],
+                                  date_field, start, end, max_pages)
             # A bad sort field is the usual cause — retry once unsorted.
             if sort_field != "Created_Time":
                 log.info("Retrying %s sorted by Created_Time", module)
@@ -296,6 +309,13 @@ def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES)
         log.warning("%s: stopped at the %d-page ceiling — RESULTS ARE TRUNCATED",
                     module, max_pages)
     return keep, complete
+
+
+def _log_optional_retry(module, dropped, path):
+    # A warning, not an error: the request may have failed for another reason.
+    # An error is logged once the evidence points at the field itself.
+    log.warning("%s: the %s request failed with optional field(s) %s in it — "
+                "retrying without them.", module, path, ", ".join(dropped))
 
 
 def parse_dt(value):
@@ -372,19 +392,38 @@ def _sync_modules(conn, now, window_start):
     summary = {}
     for module, spec in MODULES.items():
         fields = spec["fields"]
+        optional = [f for f in spec.get("optional", []) if f in fields]
         date_field = spec["date_field"]
         total = 0
         method = "coql"
         complete = True
+        seen = set()            # optional fields Zoho actually returned
 
         chunk_start = window_start
         coql_worked = True
         while chunk_start < now:
             chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), now)
             rows, ok = coql_fetch(module, fields, date_field, chunk_start, chunk_end)
+            if not ok and any(f in fields for f in optional):
+                # A wrong API name in the select list fails the whole query.
+                # Retry without the optional fields; if that fails too, they
+                # were not the cause, so keep them for the list fallback.
+                _log_optional_retry(module, optional, "COQL")
+                trimmed = [f for f in fields if f not in optional]
+                rows, ok = coql_fetch(module, trimmed, date_field, chunk_start, chunk_end)
+                if ok:
+                    log.error("%s: COQL works without %s, so that API name is wrong. "
+                              "It is dropped for this sync and will be missing from "
+                              "every %s record until crm_sync.MODULES is fixed.",
+                              module, ", ".join(optional), module)
+                    fields = trimmed
+                else:
+                    log.warning("%s: COQL failed without the optional field(s) too, so "
+                                "they are not the cause.", module)
             if not ok:
                 coql_worked = False
                 break
+            seen.update(f for f in optional for r in rows if f in r)
             store(conn, module, rows)
             total += len(rows)
             log.info("%s %s→%s: %d rows", module,
@@ -395,9 +434,20 @@ def _sync_modules(conn, now, window_start):
             log.warning("%s: COQL unavailable — falling back to the list endpoint. "
                         "This walks pages newest-first until it passes the window.", module)
             method = "list-fallback"
-            rows, complete = list_fetch(module, fields, date_field, window_start, now)
+            rows, complete = list_fetch(module, fields, date_field, window_start, now,
+                                        optional=[f for f in optional if f in fields])
+            seen.update(f for f in optional for r in rows if f in r)
             store(conn, module, rows)
             total = len(rows)
+
+        # Zoho can also accept an unknown field name and simply leave it out of
+        # every record. That fails nothing, so check for it explicitly.
+        absent = [f for f in optional if f not in seen]
+        if total and absent:
+            log.error("%s: none of the %d records stored carries %s. The field was "
+                      "dropped above, or Zoho ignored it because the API name is "
+                      "wrong. Anything that reads it is falling back.",
+                      module, total, ", ".join(absent))
 
         conn.execute(
             "INSERT INTO sync_log (module, method, rows, synced_at, complete) "
