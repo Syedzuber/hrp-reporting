@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 
+import jobruns
 import settings
 
 logging.basicConfig(
@@ -48,63 +49,97 @@ def _hhmm(value, fallback="08:00"):
 
 
 def _wrap(name, fn):
-    """Run a job, record the outcome, never let an exception kill the scheduler."""
+    """Run a job, record the outcome, never let an exception kill the scheduler.
+
+    LAST_RUN feeds the status page only. It is lost on every restart, so the
+    outcome is also written to the job_runs table, which is what the
+    healthcheck reads.
+    """
     def runner():
         started = datetime.now(TZ)
+        run_id = jobruns.start(name, started)
         log.info("=== %s starting ===", name)
         try:
             fn()
             LAST_RUN[name] = {"at": started.isoformat(), "status": "ok"}
+            jobruns.finish(run_id, name, started, datetime.now(TZ), "ok")
             log.info("=== %s ok ===", name)
         except Exception as exc:
             LAST_RUN[name] = {"at": started.isoformat(), "status": "failed",
                               "error": str(exc)[:400]}
+            jobruns.finish(run_id, name, started, datetime.now(TZ), "failed",
+                           str(exc)[:400])
             log.exception("=== %s FAILED: %s ===", name, exc)
     return runner
 
 
 # ── jobs ──────────────────────────────────────────────────────────────
 
+# The report functions catch a mail failure, log it and return None rather
+# than raising. Without the checks below, a report that never reached anyone
+# would be recorded as "ok".
+
 def job_morning():
     import crm_sync
     from hrp_report.daily_pdf_email import send_daily_pdf
     crm_sync.sync()
-    send_daily_pdf()
+    if not send_daily_pdf():
+        raise RuntimeError("Morning report was not emailed — see the mail error above.")
 
 
 def job_evening():
     from hrp_report.evening import send_evening_report
-    send_evening_report()          # syncs internally
+    if not send_evening_report():  # syncs internally
+        raise RuntimeError("Evening report was not emailed — see the mail error above.")
 
 
 def job_shift():
     from hrp_report.shift import send_shift_report
-    send_shift_report()            # syncs internally
+    if not send_shift_report():    # syncs internally
+        raise RuntimeError("Shift report was not emailed — see the mail error above.")
 
 
 def job_healthcheck():
     from hrp_report.healthcheck import run_check
-    run_check()
+    state = run_check()
+    # A check that found problems is recorded as failed, so the status page
+    # cannot say "ok" while the reports are down.
+    if not state["healthy"]:
+        sent = "sent" if state["alert_sent"] else "NOT sent"
+        raise RuntimeError(f"{len(state['problems'])} problem(s) found, alert {sent}. "
+                           f"First: {state['problems'][0]}")
 
 
 # ── status endpoint ───────────────────────────────────────────────────
 
+def status() -> dict:
+    from hrp_report.healthcheck import database_state
+    # This used to report db_exists, which only checked that the file was
+    # there. SQLite creates an empty file on connect, so it was true for a
+    # database with no tables. These say what is actually in it.
+    db = database_state()
+    return {
+        "service": "hrp-reporting",
+        "now": datetime.now(TZ).isoformat(),
+        "timezone": settings.TIMEZONE,
+        "schedule": {
+            "morning": settings.MORNING_AT if settings.MORNING_ENABLED else "disabled",
+            "shifts": settings.SHIFT_TIMES if settings.SHIFT_ENABLED else "disabled",
+            "evening_legacy": settings.EVENING_AT if settings.EVENING_ENABLED else "disabled",
+            "healthcheck": settings.HEALTHCHECK_AT if settings.HEALTHCHECK_ENABLED else "disabled",
+        },
+        "last_runs": LAST_RUN,
+        "db_path": settings.DB_PATH,
+        "db_has_records": db["has_records"],
+        "records_by_module": db["records"],
+        "last_sync": db["last_sync"].isoformat() if db["last_sync"] else None,
+        "db_error": db["error"],
+    }
+
+
 class Status(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({
-            "service": "hrp-reporting",
-            "now": datetime.now(TZ).isoformat(),
-            "timezone": settings.TIMEZONE,
-            "schedule": {
-                "morning": settings.MORNING_AT if settings.MORNING_ENABLED else "disabled",
-                "shifts": settings.SHIFT_TIMES if settings.SHIFT_ENABLED else "disabled",
-                "evening_legacy": settings.EVENING_AT if settings.EVENING_ENABLED else "disabled",
-                "healthcheck": settings.HEALTHCHECK_AT if settings.HEALTHCHECK_ENABLED else "disabled",
-            },
-            "last_runs": LAST_RUN,
-            "db_path": settings.DB_PATH,
-            "db_exists": os.path.exists(settings.DB_PATH),
-        }, indent=1).encode()
+        body = json.dumps(status(), indent=1).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

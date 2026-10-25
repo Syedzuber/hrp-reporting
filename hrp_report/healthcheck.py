@@ -1,25 +1,29 @@
 """
-hrp_report.healthcheck — watchdog for the two CEO reports.
+hrp_report.healthcheck — watchdog for the CEO reports.
 
-Runs as its OWN scheduled task, deliberately separate from the reports it
-watches. A warning can only travel inside something that gets sent, and the
-failure that matters most — a task not running at all — sends nothing. Only an
-outside observer catches that.
+Runs as its own scheduled job inside scheduler.py. It used to read only
+sync_log and the report PDFs, and stayed silent whenever it could not tell
+what was going on — so for two months in which every report job failed, it
+found nothing wrong and the status page showed it as "ok" every night. Every
+check here now treats an absence of evidence as a failure, never as health.
 
-It checks three things and emails ONLY the operator (never the CEO list) when
-any of them is stale:
+It checks:
 
-  1. the CRM snapshot in hrp_crm.db (via sync_log)
-  2. the newest morning report PDF
-  3. the newest evening report PDF, if one has ever been produced
+  1. the database — the records table exists and has rows, and the newest
+     sync_log entry is recent. Row counts per module go into every alert.
+  2. every scheduled report job, from the job_runs table that scheduler.py
+     writes on every run (see jobruns.py). A job is a problem if its last run
+     failed, if it started and never finished, or if it has not run since its
+     most recent scheduled time. No runs recorded at all is a failure.
+  3. the newest morning and evening report PDFs, as before.
+
+Alerts go to ALERT_TO only, through mailer.py. There is deliberately no
+fallback to RECIPIENTS, which is the CEO list: if ALERT_TO is empty, that is
+itself reported as a problem and nothing is sent.
 
 If everything is healthy it sends nothing at all, so it never becomes noise.
 
-Alert recipients come from config.ALERT_TO if defined; otherwise it falls back
-to the first address in config.RECIPIENTS that is not on the company domain,
-so a misconfiguration cannot accidentally page the CEO.
-
-Run standalone:   python -m hrp_report.healthcheck
+Run standalone:   python -m hrp_report.healthcheck          exits 1 on any problem
 Force a test:     python -m hrp_report.healthcheck --test
 """
 
@@ -28,32 +32,34 @@ from __future__ import annotations
 import glob
 import logging
 import os
-import re
-import smtplib
 import sqlite3
 import sys
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.utils import formataddr, formatdate, make_msgid
+from urllib.request import pathname2url
 
 import pytz
 
-import settings as config
+import jobruns
 import settings
 from mailer import MailError, send as send_mail
 
 log = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = settings.DB_PATH
 REPORTS = settings.REPORTS_DIR
-LOGS = os.path.join(HERE, "logs")
 
 # A daily job is late once it has missed a full cycle plus a couple of hours
 # of slack for a machine that woke up slowly.
 STALE_HOURS = 26
+
+# A job is due once its clock time plus this has passed, so a check that
+# happens to run at the same minute does not race the job it is checking.
+START_GRACE = timedelta(minutes=15)
+
+# A run still marked "running" after this long was killed or has hung. A full
+# 300-day sync takes minutes, not hours.
+MAX_RUNTIME = timedelta(hours=2)
 
 MORNING_GLOB = "HRP_Daily_Sales_Numbers_*.pdf"
 EVENING_GLOB = "HRP_End_of_Day_*.pdf"
@@ -61,40 +67,84 @@ EVENING_GLOB = "HRP_End_of_Day_*.pdf"
 
 # ── helpers ───────────────────────────────────────────────────────────
 
-def _alert_recipients() -> list:
-    """Operator addresses. Never the CEO distribution list."""
-    explicit = getattr(config, "ALERT_TO", None)
-    if explicit:
-        return list(explicit) if isinstance(explicit, (list, tuple)) else [explicit]
+def _open_readonly(path):
+    """Open an existing database without ever creating one.
 
-    company = (config.SMTP_FROM.split("@")[-1] or "").lower()
-    outside = [r for r in config.RECIPIENTS if not r.lower().endswith("@" + company)]
-    if outside:
-        return outside
-    # Last resort: the first recipient, so the alert still goes somewhere.
-    return config.RECIPIENTS[:1]
+    sqlite3.connect() on a missing path quietly creates an empty file, which
+    is how an empty database used to pass as present. Read-only mode refuses.
+    """
+    if not os.path.exists(path):
+        return None
+    uri = "file:" + pathname2url(os.path.abspath(path)) + "?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=30)
 
 
-def _snapshot_age():
-    """(datetime, hours_old) of the most recent CRM sync, or (None, None)."""
-    if not os.path.exists(DB_PATH):
-        return None, None
+def _ist(value):
+    if not value:
+        return None
+    when = datetime.fromisoformat(value)
+    if when.tzinfo is None:
+        when = IST.localize(when)
+    return when.astimezone(IST)
+
+
+def database_state(db_path: str | None = None) -> dict:
+    """What is actually in the snapshot. scheduler.py's status page uses this too."""
+    path = db_path or DB_PATH
+    state = {"path": path, "exists": False, "tables": [], "records": {},
+             "total": 0, "has_records": False, "last_sync": None, "error": None}
     try:
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            row = conn.execute("SELECT MAX(synced_at) FROM sync_log").fetchone()
-        finally:
-            conn.close()
-        if not row or not row[0]:
-            return None, None
-        when = datetime.fromisoformat(row[0])
-        if when.tzinfo is None:
-            when = IST.localize(when)
-        when = when.astimezone(IST)
-        return when, (datetime.now(IST) - when).total_seconds() / 3600.0
+        conn = _open_readonly(path)
     except Exception as exc:
-        log.error("Could not read sync_log: %s", exc)
-        return None, None
+        state["error"] = str(exc)
+        return state
+    if conn is None:
+        return state
+    state["exists"] = True
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        state["tables"] = sorted(tables)
+        if "records" in tables:
+            state["records"] = dict(conn.execute(
+                "SELECT module, COUNT(*) FROM records GROUP BY module ORDER BY module"))
+            state["total"] = sum(state["records"].values())
+            state["has_records"] = state["total"] > 0
+        if "sync_log" in tables:
+            row = conn.execute("SELECT MAX(synced_at) FROM sync_log").fetchone()
+            state["last_sync"] = _ist(row[0]) if row else None
+    except Exception as exc:
+        state["error"] = str(exc)
+    finally:
+        conn.close()
+    return state
+
+
+def latest_runs(db_path: str | None = None) -> dict:
+    """{job: its most recent job_runs row}. Empty if nothing has been recorded."""
+    conn = _open_readonly(db_path or DB_PATH)
+    if conn is None:
+        return {}
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='job_runs'").fetchone():
+            return {}
+        rows = conn.execute(
+            "SELECT job, started_at, finished_at, status, error FROM job_runs "
+            "WHERE id IN (SELECT MAX(id) FROM job_runs GROUP BY job)").fetchall()
+    finally:
+        conn.close()
+    return {job: {"started_at": _ist(started), "finished_at": _ist(finished),
+                  "status": status, "error": error}
+            for job, started, finished, status, error in rows}
+
+
+def _last_due(now, at):
+    """The most recent time a daily job at clock time `at` should have started."""
+    due = IST.localize(datetime.combine(now.date(), at))
+    if due > now - START_GRACE:
+        due -= timedelta(days=1)
+    return due
 
 
 def _newest(pattern):
@@ -107,61 +157,105 @@ def _newest(pattern):
     return newest, when, (datetime.now(IST) - when).total_seconds() / 3600.0
 
 
-def _log_tail(name, lines=18):
-    path = os.path.join(LOGS, name)
-    if not os.path.exists(path):
-        return f"({name} does not exist — the task has never run from this folder)"
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            content = fh.readlines()
-        return "".join(content[-lines:]).rstrip() or "(log is empty)"
-    except Exception as exc:
-        return f"(could not read {name}: {exc})"
+def _when(d):
+    return d.strftime("%a %d %b %Y %H:%M IST") if d else "never"
 
 
-def _last_run_verdict(name):
-    """Read the last RUN line from a log so the alert can name the outcome."""
-    path = os.path.join(LOGS, name)
-    if not os.path.exists(path):
-        return "never run"
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            hits = [l.strip() for l in fh if re.match(r"RUN (OK|FAILED|ABORTED|STARTED)", l)]
-        return hits[-1] if hits else "no RUN lines found"
-    except Exception:
-        return "unreadable"
+# ── the checks ────────────────────────────────────────────────────────
+
+def _database_problems(db, now):
+    problems = []
+    if db["error"]:
+        problems.append(f"Database: {db['path']} could not be read ({db['error']}).")
+        return problems
+    if not db["exists"]:
+        problems.append(
+            f"Database: {db['path']} does not exist. No sync has ever written to it, "
+            f"so every report is built from nothing.")
+        return problems
+    if "records" not in db["tables"]:
+        problems.append(
+            f"Database: {db['path']} exists but has no records table. No sync has "
+            f"ever completed against this file, so every report query fails.")
+    elif not db["has_records"]:
+        problems.append("Database: the records table exists but is empty. The sync "
+                        "ran without storing anything.")
+
+    if db["last_sync"] is None:
+        problems.append("CRM sync: sync_log has no entries, so there is no evidence a "
+                        "sync has ever run.")
+    else:
+        age = (now - db["last_sync"]).total_seconds() / 3600.0
+        if age > STALE_HOURS:
+            problems.append(
+                f"CRM data is {age:.0f} hours old — last synced "
+                f"{db['last_sync'].strftime('%a %d %b %Y at %H:%M IST')}. Every figure in "
+                f"the reports is stale, and zeros will read as inactivity rather than as "
+                f"missing data.")
+    return problems
 
 
-# ── the check ─────────────────────────────────────────────────────────
+def _job_problems(scheduled, runs, now):
+    problems = []
+    for name, at in scheduled:
+        label = f"Job {name} (daily {at:%H:%M})"
+        run = runs.get(name)
+        if run is None:
+            # The bug this replaces: an empty record was read as "nothing wrong".
+            problems.append(
+                f"{label}: no runs recorded at all. There is no evidence it has "
+                f"ever run, so it is treated as failed.")
+            continue
 
-def run_check(force: bool = False) -> dict:
-    snap_at, snap_age = _snapshot_age()
+        due = _last_due(now, at)
+        started, status = run["started_at"], run["status"]
+        error = f" Error: {run['error']}" if run["error"] else ""
+        if started is None or started < due:
+            problems.append(
+                f"{label}: did not run at {_when(due)}. Its last recorded run started "
+                f"{_when(started)} with status {status}.{error}")
+        elif status == "failed":
+            problems.append(f"{label}: last run FAILED, started {_when(started)}.{error}")
+        elif status == "running":
+            if now - started > MAX_RUNTIME:
+                problems.append(
+                    f"{label}: started {_when(started)} and never finished. The "
+                    f"process was killed or the job hung part-way.")
+        elif status != "ok":
+            problems.append(f"{label}: last run has unrecognised status {status!r}.")
+    return problems
+
+
+def run_check(force: bool = False, now: datetime | None = None) -> dict:
+    now = now or datetime.now(IST)
+    db = database_state()
+    runs = latest_runs()
+    scheduled = jobruns.scheduled_jobs()
     m_path, m_at, m_age = _newest(MORNING_GLOB)
     e_path, e_at, e_age = _newest(EVENING_GLOB)
+    recipients = list(settings.ALERT_TO or [])
 
     problems = []
+    if not recipients:
+        log.error("ALERT_TO is empty — the healthcheck has nowhere to send alerts.")
+        problems.append(
+            "ALERT_TO is not set, so this watchdog has nowhere to send alerts. It "
+            "does not fall back to RECIPIENTS, the CEO list. Set ALERT_TO in Railway.")
 
-    if snap_at is None:
-        problems.append(
-            "CRM snapshot: could not be read at all. hrp_crm.db is missing, empty or "
-            "corrupt, so both reports are running blind.")
-    elif snap_age > STALE_HOURS:
-        problems.append(
-            f"CRM data is {snap_age:.0f} hours old — last synced "
-            f"{snap_at.strftime('%a %d %b %Y at %H:%M IST')}. Every figure in both "
-            f"reports is stale, and zeros will read as inactivity rather than as "
-            f"missing data.")
+    problems += _database_problems(db, now)
+    problems += _job_problems(scheduled, runs, now)
 
-    if m_at is None:
-        problems.append(
-            "Morning report: no PDF has ever been produced in the reports folder.")
-    elif m_age > STALE_HOURS:
-        problems.append(
-            f"Morning report last produced {m_at.strftime('%a %d %b at %H:%M IST')} "
-            f"({m_age:.0f} hours ago) — {os.path.basename(m_path)}.")
+    if settings.MORNING_ENABLED:
+        if m_at is None:
+            problems.append(
+                "Morning report: no PDF has ever been produced in the reports folder.")
+        elif m_age > STALE_HOURS:
+            problems.append(
+                f"Morning report last produced {m_at.strftime('%a %d %b at %H:%M IST')} "
+                f"({m_age:.0f} hours ago) — {os.path.basename(m_path)}.")
 
     # Only complain about the evening report once it has run at least once,
-    # so this does not fire before that task is registered.
+    # so this does not fire before that job is enabled.
     if e_at is not None and e_age > STALE_HOURS:
         problems.append(
             f"Evening report last produced {e_at.strftime('%a %d %b at %H:%M IST')} "
@@ -169,66 +263,86 @@ def run_check(force: bool = False) -> dict:
 
     state = {
         "problems": problems,
-        "snapshot_at": snap_at,
-        "snapshot_age": snap_age,
+        "database": db,
+        "runs": runs,
+        "scheduled": scheduled,
+        "snapshot_at": db["last_sync"],
         "morning_at": m_at,
         "evening_at": e_at,
+        "checked_at": now,
         "healthy": not problems,
+        # None: no alert was needed. True/False: one was attempted.
+        "alert_sent": None,
     }
 
     if problems or force:
-        _send_alert(state, force=force and not problems)
+        state["alert_sent"] = _send_alert(state, recipients, force=force and not problems)
     else:
-        log.info("Healthy — snapshot %.1fh old, morning report %.1fh old. No alert sent.",
-                 snap_age or -1, m_age if m_age is not None else -1)
+        log.info("Healthy — %d records, last sync %s, %d jobs on schedule. No alert sent.",
+                 db["total"], _when(db["last_sync"]), len(scheduled))
     return state
 
 
-def _send_alert(state, force=False):
-    to = _alert_recipients()
-    problems = state["problems"]
+def exit_code(state) -> int:
+    """Non-zero when anything is wrong, including an alert that did not go out."""
+    return 0 if state["healthy"] and state["alert_sent"] is not False else 1
 
-    when = lambda d: d.strftime("%a %d %b %Y %H:%M IST") if d else "never"
+
+def _send_alert(state, recipients, force=False) -> bool:
+    problems = state["problems"]
+    if not recipients:
+        log.error("Healthcheck alert NOT sent: ALERT_TO is empty (%d problem(s)).",
+                  len(problems))
+        return False
+
+    db = state["database"]
     subject = ("[TEST] CEO reports healthcheck" if force else
                f"ACTION NEEDED - CEO reports have stopped ({len(problems)} issue"
                f"{'s' if len(problems) != 1 else ''})")
+
+    if db["records"]:
+        counts = ", ".join(f"{m} {n:,}" for m, n in db["records"].items())
+        records = f"{db['total']:,} ({counts})"
+    else:
+        records = "none"
 
     lines = [
         "CEO REPORT HEALTHCHECK",
         "",
         ("This is a test run — the checks below all passed." if force else
-         "One or more of the daily CEO reports is not running correctly."),
+         "One or more of the CEO reports is not running correctly."),
         "",
         "STATUS",
-        f"  CRM data last synced   : {when(state['snapshot_at'])}",
-        f"  Morning report (08:00) : {when(state['morning_at'])}",
-        f"  Evening report (18:30) : {when(state['evening_at'])}",
+        f"  Database               : {db['path']}",
+        f"  Records stored         : {records}",
+        f"  CRM data last synced   : {_when(state['snapshot_at'])}",
+        f"  Morning report PDF     : {_when(state['morning_at'])}",
+        f"  Evening report PDF     : {_when(state['evening_at'])}",
         "",
+        "JOBS (most recent recorded run)",
     ]
+    for name, at in state["scheduled"]:
+        run = state["runs"].get(name)
+        if run is None:
+            lines.append(f"  {name:<12} {at:%H:%M}  no runs recorded")
+        else:
+            lines.append(f"  {name:<12} {at:%H:%M}  {run['status']:<8} "
+                         f"{_when(run['started_at'])}")
+    lines.append("")
+
     if problems:
         lines += ["WHAT IS WRONG"]
         lines += [f"  {i}. {p}" for i, p in enumerate(problems, 1)]
         lines += [
             "",
             "FIRST THINGS TO CHECK",
-            '  schtasks /query /tn "HRP Daily CEO Report" /v /fo LIST',
-            '  schtasks /query /tn "HRP Evening CEO Report" /v /fo LIST',
-            "  Look at Last Run Time, Last Result and Task To Run. A Task To Run",
-            "  pointing at a folder that no longer exists is the known failure mode.",
+            "  Railway > this service > Deployments > View logs, around the times above.",
+            "  The service URL shows last_runs, db_has_records and last_sync.",
             "",
         ]
     lines += [
-        "MORNING LOG (last lines)",
-        _log_tail("daily_report.log"),
-        "",
-        "EVENING LOG (last lines)",
-        _log_tail("evening_report.log"),
-        "",
-        f"Last morning run line : {_last_run_verdict('daily_report.log')}",
-        f"Last evening run line : {_last_run_verdict('evening_report.log')}",
-        "",
-        f"Checked at {datetime.now(IST).strftime('%a %d %b %Y %H:%M IST')} on this machine.",
-        "Sent only to the operator, not to the CEO distribution list.",
+        f"Checked at {_when(state['checked_at'])}.",
+        "Sent only to ALERT_TO, never to the CEO distribution list.",
     ]
     body = "\n".join(lines)
 
@@ -237,10 +351,12 @@ def _send_alert(state, force=False):
             body.replace("&", "&amp;").replace("<", "&lt;") +
             "</body></html>")
     try:
-        send_mail(subject=subject, text_body=body, html_body=html, to=to)
-        log.warning("Healthcheck alert sent to %s (%d problem(s))", to, len(problems))
+        send_mail(subject=subject, text_body=body, html_body=html, to=recipients)
+        log.warning("Healthcheck alert sent to %s (%d problem(s))", recipients, len(problems))
+        return True
     except MailError as exc:
         log.error("Healthcheck alert FAILED to send: %s", exc)
+        return False
 
 
 if __name__ == "__main__":
@@ -251,4 +367,6 @@ if __name__ == "__main__":
         print("PROBLEM:", p)
     if result["healthy"]:
         print("Healthy — nothing sent.")
-    sys.exit(0)
+    if result["alert_sent"] is False:
+        print("ALERT NOT SENT.")
+    sys.exit(exit_code(result))
