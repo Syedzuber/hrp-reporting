@@ -36,19 +36,24 @@ DB_PATH = settings.DB_PATH
 OUT_DIR = settings.REPORTS_DIR
 
 
-def refresh_snapshot() -> bool:
-    """Pull the latest records into hrp_crm.db. Non-fatal on failure."""
+def refresh_snapshot() -> Exception | None:
+    """Pull the latest records into hrp_crm.db.
+
+    Returns None on success, or the error. It never raises: the report is still
+    built from the previous snapshot, and send_daily_pdf passes the failure on.
+    """
     try:
         import crm_sync
         for fn in ("sync_all", "run_sync", "main", "sync"):
             if hasattr(crm_sync, fn):
                 getattr(crm_sync, fn)()
                 log.info("Snapshot refreshed via crm_sync.%s()", fn)
-                return True
-        log.warning("crm_sync has no recognised entry point; using existing snapshot.")
+                return None
+        raise RuntimeError("crm_sync has no recognised entry point")
     except Exception as exc:
-        log.error("Snapshot refresh failed (%s) — using existing snapshot.", exc)
-    return False
+        log.error("CRM SYNC FAILED (%s) — building the morning report from the previous "
+                  "snapshot. It will still be sent; this run will be recorded as failed.", exc)
+        return exc
 
 
 def _body_html(rep: dict) -> str:
@@ -152,7 +157,7 @@ def _body_text(rep: dict) -> str:
 
 
 def send_daily_pdf(as_of=None) -> str | None:
-    refresh_snapshot()
+    sync_error = refresh_snapshot()
 
     if as_of is None:
         # MORNING report (08:00): yesterday plus the two days before it, all
@@ -175,10 +180,14 @@ def send_daily_pdf(as_of=None) -> str | None:
             attachment=pdf_path,
         )
         log.info("Daily PDF sent to %s", config.RECIPIENTS)
-        return pdf_path
+        sent = pdf_path
     except MailError as exc:
         log.error("Daily PDF email failed: %s", exc)
-        return None
+        sent = None
+
+    if sync_error is not None:
+        raise metrics.SyncFailed("morning report", sync_error, bool(sent)) from sync_error
+    return sent
 
 
 if __name__ == "__main__":

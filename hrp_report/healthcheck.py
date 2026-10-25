@@ -42,6 +42,7 @@ import pytz
 import jobruns
 import settings
 from mailer import MailError, send as send_mail
+from .metrics import GOOD_SYNC
 
 log = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
@@ -92,7 +93,8 @@ def database_state(db_path: str | None = None) -> dict:
     """What is actually in the snapshot. scheduler.py's status page uses this too."""
     path = db_path or DB_PATH
     state = {"path": path, "exists": False, "tables": [], "records": {},
-             "total": 0, "has_records": False, "last_sync": None, "error": None}
+             "total": 0, "has_records": False, "last_sync": None,
+             "last_attempt": None, "error": None}
     try:
         conn = _open_readonly(path)
     except Exception as exc:
@@ -111,8 +113,13 @@ def database_state(db_path: str | None = None) -> dict:
             state["total"] = sum(state["records"].values())
             state["has_records"] = state["total"] > 0
         if "sync_log" in tables:
-            row = conn.execute("SELECT MAX(synced_at) FROM sync_log").fetchone()
+            # Freshness counts only syncs that completed and stored rows, the
+            # same rule as the reports' stale banners (metrics.GOOD_SYNC).
+            row = conn.execute(
+                f"SELECT MAX(synced_at) FROM sync_log WHERE {GOOD_SYNC}").fetchone()
             state["last_sync"] = _ist(row[0]) if row else None
+            row = conn.execute("SELECT MAX(synced_at) FROM sync_log").fetchone()
+            state["last_attempt"] = _ist(row[0]) if row else None
     except Exception as exc:
         state["error"] = str(exc)
     finally:
@@ -182,8 +189,9 @@ def _database_problems(db, now):
                         "ran without storing anything.")
 
     if db["last_sync"] is None:
-        problems.append("CRM sync: sync_log has no entries, so there is no evidence a "
-                        "sync has ever run.")
+        problems.append("CRM sync: sync_log has no successful entry — none that "
+                        "completed and stored rows — so there is no evidence a sync "
+                        "has ever worked.")
     else:
         age = (now - db["last_sync"]).total_seconds() / 3600.0
         if age > STALE_HOURS:
@@ -192,6 +200,11 @@ def _database_problems(db, now):
                 f"{db['last_sync'].strftime('%a %d %b %Y at %H:%M IST')}. Every figure in "
                 f"the reports is stale, and zeros will read as inactivity rather than as "
                 f"missing data.")
+    if db["last_attempt"] and (db["last_sync"] is None or db["last_attempt"] > db["last_sync"]):
+        problems.append(
+            f"CRM sync: the most recent attempt, {_when(db['last_attempt'])}, stored "
+            f"nothing usable — no module completed with rows. The data is from "
+            f"{_when(db['last_sync'])}.")
     return problems
 
 

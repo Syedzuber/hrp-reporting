@@ -37,7 +37,7 @@ import settings as config
 import settings
 from mailer import MailError, send as send_mail
 from .metrics import (
-    CALL_COMPLETED, LOST_STAGES, WON_STAGES, _dt, _link_id, load_records,
+    CALL_COMPLETED, LOST_STAGES, WON_STAGES, SyncFailed, _dt, _link_id, load_records,
     normalise_person, snapshot_time,
 )
 
@@ -976,11 +976,20 @@ def _body_html(rep):
 
 
 def send_shift_report(now=None) -> str | None:
+    """Sync, build and send. Returns the PDF path, or None if the email failed.
+
+    A failed sync does not stop the report: it is built from the previous
+    snapshot, its stale banner says so, and it is sent. SyncFailed is raised
+    afterwards so the scheduler records the run as failed.
+    """
+    sync_error = None
     try:
         import crm_sync
         crm_sync.sync(days=settings.SYNC_DAYS)
     except Exception as exc:
-        log.error("Snapshot refresh failed (%s) — using existing snapshot.", exc)
+        sync_error = exc
+        log.error("CRM SYNC FAILED (%s) — building the shift report from the previous "
+                  "snapshot. It will still be sent; this run will be recorded as failed.", exc)
 
     rep = build_shift_data(DB_PATH, now=now)
     w1 = rep["windows"][0]
@@ -998,10 +1007,14 @@ def send_shift_report(now=None) -> str | None:
             text_body=_body_text(rep), html_body=_body_html(rep),
             to=config.RECIPIENTS, attachment=pdf_path)
         log.info("Shift report sent to %s", config.RECIPIENTS)
-        return pdf_path
+        sent = pdf_path
     except MailError as exc:
         log.error("Shift report email failed: %s", exc)
-        return None
+        sent = None
+
+    if sync_error is not None:
+        raise SyncFailed("shift report", sync_error, bool(sent)) from sync_error
+    return sent
 
 
 if __name__ == "__main__":

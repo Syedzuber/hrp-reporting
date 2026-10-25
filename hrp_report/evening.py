@@ -38,7 +38,7 @@ import settings as config
 import settings
 from mailer import MailError, send as send_mail
 from .metrics import (
-    CALL_COMPLETED, _day, _dt, _link_id, load_records, normalise_person,
+    CALL_COMPLETED, SyncFailed, _day, _dt, _link_id, load_records, normalise_person,
     snapshot_time,
 )
 
@@ -526,12 +526,17 @@ def _body_text(rep: dict) -> str:
 
 
 def send_evening_report(as_of=None) -> str | None:
+    """Sync, build and send. A failed sync is handled as in send_shift_report:
+    the report still goes out, then SyncFailed is raised."""
+    sync_error = None
     try:
         import crm_sync
         crm_sync.sync()
         log.info("Snapshot refreshed.")
     except Exception as exc:
-        log.error("Snapshot refresh failed (%s) — using existing snapshot.", exc)
+        sync_error = exc
+        log.error("CRM SYNC FAILED (%s) — building the evening report from the previous "
+                  "snapshot. It will still be sent; this run will be recorded as failed.", exc)
 
     rep = build_evening_data(DB_PATH, as_of=as_of)
     day = rep["days"][0]["date"]
@@ -549,10 +554,14 @@ def send_evening_report(as_of=None) -> str | None:
             attachment=pdf_path,
         )
         log.info("End of day report sent to %s", config.RECIPIENTS)
-        return pdf_path
+        sent = pdf_path
     except MailError as exc:
         log.error("End of day email failed: %s", exc)
-        return None
+        sent = None
+
+    if sync_error is not None:
+        raise SyncFailed("evening report", sync_error, bool(sent)) from sync_error
+    return sent
 
 
 if __name__ == "__main__":

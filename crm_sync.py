@@ -44,20 +44,33 @@ _token_expiry = None
 _token_lock = threading.Lock()
 
 
+class AuthError(RuntimeError):
+    """Zoho would not issue an access token, so nothing can be synced.
+
+    Raised rather than logged. The fetch functions used to catch it like any
+    other request error, carry on, and write a sync_log row for every module
+    stamped with the current time — so an expired token made stale data look
+    freshly synced.
+    """
+
+
 def get_access_token():
     global _access_token, _token_expiry
     with _token_lock:
         if _access_token and _token_expiry and datetime.now() < _token_expiry:
             return _access_token
-        r = requests.post(config.ZOHO_TOKEN_URL, params={
-            "refresh_token": config.REFRESH_TOKEN,
-            "client_id":     config.CLIENT_ID,
-            "client_secret": config.CLIENT_SECRET,
-            "grant_type":    "refresh_token",
-        }, timeout=15)
-        data = r.json()
+        try:
+            r = requests.post(config.ZOHO_TOKEN_URL, params={
+                "refresh_token": config.REFRESH_TOKEN,
+                "client_id":     config.CLIENT_ID,
+                "client_secret": config.CLIENT_SECRET,
+                "grant_type":    "refresh_token",
+            }, timeout=15)
+            data = r.json()
+        except Exception as exc:
+            raise AuthError(f"Token refresh request failed: {exc}") from exc
         if "access_token" not in data:
-            raise RuntimeError(f"Token refresh failed: {data}")
+            raise AuthError(f"Token refresh failed: {data}")
         _access_token = data["access_token"]
         _token_expiry = datetime.now() + timedelta(seconds=3300)
         return _access_token
@@ -168,6 +181,8 @@ def coql_fetch(module, fields, date_field, start, end):
         try:
             r = requests.post(url, headers=headers(),
                               data=json.dumps({"select_query": query}), timeout=30)
+        except AuthError:
+            raise
         except Exception as exc:
             log.warning("COQL request error on %s: %s", module, exc)
             return out, False
@@ -216,6 +231,7 @@ def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES)
     sort_field = date_field if date_field.endswith("_Time") else "Created_Time"
     keep = []
     complete = False
+    stopped_by = None       # why the walk ended early, if it was not the ceiling
 
     for page in range(1, max_pages + 1):
         params = {
@@ -225,8 +241,11 @@ def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES)
         }
         try:
             r = requests.get(url, headers=headers(), params=params, timeout=30)
+        except AuthError:
+            raise
         except Exception as exc:
             log.warning("List %s page %d error: %s", module, page, exc)
+            stopped_by = f"a request error on page {page}"
             break
 
         if r.status_code == 204:
@@ -242,6 +261,7 @@ def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES)
             if sort_field != "Created_Time":
                 log.info("Retrying %s sorted by Created_Time", module)
                 return list_fetch(module, fields, "Created_Time", start, end, max_pages)
+            stopped_by = f"HTTP {r.status_code} on page {page}"
             break
 
         body = r.json()
@@ -267,7 +287,12 @@ def list_fetch(module, fields, date_field, start, end, max_pages=LIST_MAX_PAGES)
             break
         time.sleep(0.2)
 
-    if not complete:
+    # Name the real cause. This used to say "page ceiling" for every early stop,
+    # including a failure on the very first page.
+    if stopped_by:
+        log.warning("%s: list fetch stopped after %s — RESULTS ARE INCOMPLETE",
+                    module, stopped_by)
+    elif not complete:
         log.warning("%s: stopped at the %d-page ceiling — RESULTS ARE TRUNCATED",
                     module, max_pages)
     return keep, complete
@@ -326,10 +351,22 @@ def load(conn, module):
 
 # ── Orchestration ─────────────────────────────────────────────
 def sync(days=90, db_path=DB_PATH):
+    """Pull every module into the snapshot. Raises AuthError if Zoho will not
+    issue a token — before anything is written, so a sync that could not run
+    leaves no sync_log row behind to look like a fresh one."""
     now = datetime.now(IST)
     window_start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
 
+    get_access_token()
+
     conn = sqlite3.connect(db_path)
+    try:
+        return _sync_modules(conn, now, window_start)
+    finally:
+        conn.close()
+
+
+def _sync_modules(conn, now, window_start):
     init_db(conn)
 
     summary = {}
@@ -370,9 +407,8 @@ def sync(days=90, db_path=DB_PATH):
         conn.commit()
         summary[module] = {"rows": total, "method": method, "complete": complete}
         log.info("%s: %d records stored via %s%s", module, total, method,
-                 "" if complete else "  ** TRUNCATED **")
+                 "" if complete else "  ** INCOMPLETE **")
 
-    conn.close()
     return summary
 
 

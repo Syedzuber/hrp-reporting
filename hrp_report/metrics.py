@@ -164,10 +164,34 @@ def load_records(db_path: str) -> dict:
         conn.close()
 
 
+# A sync_log row only proves the data is fresh if that module's fetch completed
+# and stored something. A failed fetch still writes a row — complete=0, rows=0 —
+# stamped with the time of the attempt; counting it made old data look new.
+# The healthcheck uses the same rule.
+GOOD_SYNC = "complete = 1 AND rows > 0"
+
+
+class SyncFailed(RuntimeError):
+    """The sync before a report failed.
+
+    The report is still built, from the previous snapshot, and sent — its stale
+    banner says so. This is raised afterwards so the failure reaches the
+    scheduler and the run is recorded as failed, instead of the report going
+    out from old data while everything reads "ok".
+    """
+
+    def __init__(self, report: str, error: Exception, sent: bool):
+        super().__init__(
+            f"CRM sync failed before the {report}: {error}. The report was "
+            f"{'sent' if sent else 'NOT sent'}, built from the previous snapshot.")
+
+
 def snapshot_time(db_path: str):
+    """When the snapshot was last refreshed by a sync that actually worked."""
     conn = sqlite3.connect(db_path)
     try:
-        row = conn.execute("SELECT MAX(synced_at) FROM sync_log").fetchone()
+        row = conn.execute(
+            f"SELECT MAX(synced_at) FROM sync_log WHERE {GOOD_SYNC}").fetchone()
         return _dt(row[0]) if row and row[0] else None
     finally:
         conn.close()

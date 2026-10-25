@@ -77,12 +77,15 @@ def _wrap(name, fn):
 
 # The report functions catch a mail failure, log it and return None rather
 # than raising. Without the checks below, a report that never reached anyone
-# would be recorded as "ok".
+# would be recorded as "ok". A failed sync is different: the report still goes
+# out from the previous snapshot, and the function raises SyncFailed after
+# sending, which _wrap records as a failed run.
 
 def job_morning():
-    import crm_sync
     from hrp_report.daily_pdf_email import send_daily_pdf
-    crm_sync.sync()
+    # send_daily_pdf syncs first. This job used to sync as well, so every
+    # morning pulled the data twice — and an auth failure here would now stop
+    # the report before it was sent.
     if not send_daily_pdf():
         raise RuntimeError("Morning report was not emailed — see the mail error above.")
 
