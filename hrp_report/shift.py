@@ -37,7 +37,8 @@ import settings as config
 import settings
 from mailer import MailError, send as send_mail
 from .metrics import (
-    CALL_COMPLETED, _dt, _link_id, load_records, normalise_person, snapshot_time,
+    CALL_COMPLETED, LOST_STAGES, WON_STAGES, _dt, _link_id, load_records,
+    normalise_person, snapshot_time,
 )
 
 log = logging.getLogger(__name__)
@@ -49,12 +50,32 @@ OUT_DIR = settings.REPORTS_DIR
 ROSTER = ["Deepti", "Neelam Kumari", "Chandan Kumar Singh",
           "Shivam Tiwari", "Ashish Tripathi"]
 
+# Meeting Type is a picklist on the Meetings module: Survey / Client Discussion.
+# It was added in August 2026 and is blank on everything logged before then, so
+# the old title-keyword rule stays as a fallback rather than being replaced.
+MEETING_SURVEY = {"survey", "site survey", "site visit"}
+MEETING_CLIENT = {"client discussion", "client meeting", "meeting"}
 SURVEY_WORDS = ("survey", "site visit", "site-visit", "inspection")
 
 # The four statuses the chart tracks, in escalation order. The order carries
 # meaning — it is a progression from untouched to three failed attempts — so it
 # is never re-sorted by value.
+#
+# Unlike everything else on this report, the chart is NOT window-scoped. It is
+# the standing backlog: every lead created since LADDER_SINCE that still sits in
+# one of these four states. A nine-hour window shows almost nothing; the book as
+# a whole is the number worth acting on.
 LADDER = ["Not Rated", "Missed 1", "Missed 2", "Missed 3"]
+
+# Open deal stages in pipeline order, for the aging table. A stage not listed
+# here (a new picklist value) is appended after these rather than dropped.
+DEAL_STAGES = ["Qualification", "Needs Analysis", "Site Visit", "Costing",
+               "Proposal/Price Quote", "Negotiation/Review"]
+# (label, lowest age in days, highest age in days) — inclusive.
+DEAL_AGE_BUCKETS = [("0-7", 0, 7), ("8-15", 8, 15), ("16-30", 16, 30),
+                    ("31-60", 31, 60), ("61-90", 61, 90), ("91-180", 91, 180),
+                    ("180+", 181, None)]
+DEAL_IDLE_DAYS = 14
 
 # A sequential single-hue ramp, light to dark, because these are ordered stages
 # of the same failure rather than four unrelated categories. Lightness descends
@@ -83,12 +104,41 @@ def shift_boundaries():
     return sorted(out) or [time(11, 0), time(20, 0)]
 
 
+def _window_start_overrides():
+    """{run time -> start time} from SHIFT_WINDOW_STARTS, e.g. 20:00 -> 09:00."""
+    out = {}
+    for raw in getattr(settings, "SHIFT_WINDOW_STARTS", []) or []:
+        try:
+            run, begin = str(raw).split("=")
+            rh, rm = (int(x) for x in run.strip().split(":")[:2])
+            bh, bm = (int(x) for x in begin.strip().split(":")[:2])
+            out[(rh, rm)] = time(bh, bm)
+        except Exception:
+            log.error("Bad SHIFT_WINDOW_STARTS entry %r — ignored.", raw)
+    return out
+
+
 def window_for(now: datetime):
     """(start, end) of the interval ending at `now`.
 
-    Start is the most recent shift boundary strictly before now, looking back
-    into yesterday when the run is the first of the day.
+    Normally the start is the most recent shift boundary strictly before now,
+    looking back into yesterday when the run is the first of the day.
+
+    SHIFT_WINDOW_STARTS overrides that for a given run time. The day-end report
+    is configured as 20:00=09:00 so it covers the working day rather than the
+    hours since the 11:00 report — which means 09:00-11:00 is reported twice,
+    once in each edition. The PDF says so.
     """
+    overrides = _window_start_overrides()
+    for (rh, rm), begin in overrides.items():
+        # Match a run at, or shortly after, the configured time. A manual run
+        # at 20:07 is still the 20:00 edition.
+        run_at = IST.localize(datetime.combine(now.date(), time(rh, rm)))
+        if run_at <= now < run_at + timedelta(hours=1):
+            start = IST.localize(datetime.combine(now.date(), begin))
+            if start < now:
+                return start, now
+
     bounds = shift_boundaries()
     candidates = []
     for offset in (1, 0):
@@ -107,6 +157,21 @@ def _completed(call):
     return status in CALL_COMPLETED or (call.get("Call_Duration_in_seconds") or 0) > 0
 
 
+def _activity_at(rec):
+    """When this record was last actually worked.
+
+    Zoho's own Leads charts filter on Last Activity Time, which is why a chart
+    built in the CRM shows far more work than a count of Call records does: a
+    lead is touched whenever someone calls it, emails it, or moves its status,
+    and only some of those create a Call record.
+
+    Modified_Time is the fallback for records synced before Last_Activity_Time
+    was added to the field list. It is close but slightly looser, because a
+    workflow rule or a bulk edit moves it without anyone having worked the lead.
+    """
+    return _dt(rec.get("Last_Activity_Time")) or _dt(rec.get("Modified_Time"))
+
+
 def _index(data):
     calls, leads = data.get("Calls", []), data.get("Leads", [])
     deals, proposals = data.get("Deals", []), data.get("Proposals", [])
@@ -116,7 +181,7 @@ def _index(data):
     for rec in list(leads) + list(deals):
         who = normalise_person(rec.get("Done_By"))
         if who != "Not recorded":
-            actor[rec.get("id")] = (who, _dt(rec.get("Modified_Time")))
+            actor[rec.get("id")] = (who, _activity_at(rec))
 
     timed, seen, followup_ids = [], set(), set()
     for c in calls:
@@ -138,9 +203,21 @@ def _index(data):
         "calls": timed,
         "followup_ids": followup_ids,
         "leads": [(_dt(l.get("Created_Time")), l) for l in leads if _dt(l.get("Created_Time"))],
+        # Leads worked — the same thing Zoho's own Leads chart counts when you
+        # filter on Last Activity Time and group by Done By. See _activity_at.
+        "worked": [(_activity_at(l), l) for l in leads if _activity_at(l)],
         # Proposal Date carries no time of day, so the interval report uses the
         # record's creation timestamp instead. Daily totals still match.
         "proposals": [(_dt(p.get("Created_Time")), p) for p in proposals if _dt(p.get("Created_Time"))],
+        # Deals are how a lead is converted. There is no conversion timestamp
+        # in this CRM — Zoho_Lead_ID is empty on every deal and
+        # Lead_Conversion_Time holds a number of days, not a date — so the
+        # deal's own creation time is what places a conversion in a window.
+        "deals": [(_dt(d.get("Created_Time")), d) for d in deals if _dt(d.get("Created_Time"))],
+        # Deals worked — same Last Activity Time rule as leads. Once a lead
+        # converts it leaves the Leads module, so this is the only place the
+        # team's post-conversion calling shows up.
+        "deals_worked": [(_activity_at(d), d) for d in deals if _activity_at(d)],
         "events": [(_dt(e.get("Start_DateTime")) or _dt(e.get("Created_Time")), e)
                    for e in events],
     }
@@ -166,13 +243,33 @@ def _attribute(idx, calls, start, end):
     return dict(out)
 
 
+def _meeting_type(event):
+    """'survey', 'client' or 'unclassified' for one meeting.
+
+    Meeting Type is authoritative when it is set. When it is blank — every
+    meeting logged before the picklist existed, and any the team leaves at
+    -None- — the title is searched for survey wording instead. Anything that
+    matches neither is counted as a client meeting, since that is the larger
+    category, but it is also totalled separately so the guessing is visible.
+    """
+    mt = (event.get("Meeting_Type") or "").strip().lower()
+    if mt in MEETING_SURVEY:
+        return "survey"
+    if mt in MEETING_CLIENT:
+        return "client"
+    if mt:                      # a picklist value we have not seen before
+        return "survey" if "survey" in mt or "visit" in mt else "client"
+    title = (event.get("Event_Title") or "").lower()
+    if any(w in title for w in SURVEY_WORDS):
+        return "survey"
+    return "unclassified"
+
+
 def _is_survey(event):
-    return any(w in (event.get("Event_Title") or "").lower() for w in SURVEY_WORDS)
+    return _meeting_type(event) == "survey"
 
 
 def window_metrics(idx, start, end):
-    calls = [c for when, c in idx["calls"] if start <= when < end]
-    followups = [c for c in calls if id(c) in idx["followup_ids"]]
     leads = _in(idx["leads"], start, end)
     proposals = _in(idx["proposals"], start, end)
     events = _in(idx["events"], start, end)
@@ -186,37 +283,237 @@ def window_metrics(idx, start, end):
 
     status = tally(leads, lambda l: (l.get("Lead_Status") or "Not set").strip() or "Not set")
 
+    # ── calls, counted from the Leads module rather than the Calls module ──
+    #
+    # The Calls module is not usable as a call count: on a typical day two
+    # thirds of its records sit at Overdue, meaning a call was scheduled and
+    # the record never closed, even though the call was made. The team's real
+    # record of a call is on the lead itself — they set Latest Call Action
+    # (Missed, Interested, Call Back, Not Interested, …) every time they ring
+    # someone. Between 92% and 99% of leads touched on any given day carry one.
+    #
+    # So a call here is: a lead whose last activity falls in this window and
+    # which carries a call outcome. The known limit, printed on the report, is
+    # that a lead rung twice in one window counts once.
+    deals_new = _in(idx["deals"], start, end)
+
+    worked = _in(idx["worked"], start, end)
+    called = [l for l in worked if (l.get("Latest_Call_Action") or "").strip()]
+
+    # A call to a lead that already existed before this window is a follow-up;
+    # a call to a lead created inside it is a first contact.
+    new_ids = {l.get("id") for l in leads}
+    followups = [l for l in called if l.get("id") not in new_ids]
+    first_contact = [l for l in called if l.get("id") in new_ids]
+
+    # ── deals worked ──
+    #
+    # Every open deal whose last activity falls in this window — the same
+    # figure Zoho's Deals chart shows when filtered on Last Activity Time and
+    # grouped by Done By. It is split two ways so neither inflates the other:
+    #   * converted this window — the deal was created inside it. A converted
+    #     lead leaves the Leads module, so the call made while converting is
+    #     not counted as a lead call; it is counted here instead.
+    #   * follow-ups — the deal existed before this window.
+    # Deals now at Closed Won / Lost are left out: there is no stage-change
+    # timestamp, so a closed deal's last activity is taken to be the closing.
+    # No Latest Call Action is required, unlike leads — Zoho's chart does not
+    # require one either.
+    new_deal_ids = {d.get("id") for d in deals_new}
+    closed = WON_STAGES | LOST_STAGES
+    deals_worked = [
+        d for d in _in(idx["deals_worked"], start, end)
+        if (d.get("Stage") or "").strip().lower() not in closed
+    ]
+    deal_followups = [d for d in deals_worked if d.get("id") not in new_deal_ids]
+    deal_new_worked = [d for d in deals_worked if d.get("id") in new_deal_ids]
+
+    def by_person(items):
+        return tally(items, lambda l: normalise_person(l.get("Done_By")))
+
     return {
         "start": start, "end": end,
         "hours": round((end - start).total_seconds() / 3600.0, 1),
-        "calls": len(calls),
-        "calls_by_person": _attribute(idx, calls, start, end),
+        "calls": len(called),
+        "calls_by_person": by_person(called),
         "followups": len(followups),
-        "followups_by_person": _attribute(idx, followups, start, end),
+        "followups_by_person": by_person(followups),
+        "first_contact": len(first_contact),
+        # Every lead touched, whether or not a call outcome was recorded. Kept
+        # so the difference from `calls` shows how much activity is untracked.
+        "leads_worked": len(worked),
+        "leads_worked_by_person": by_person(worked),
+        # Kept apart from `calls` so lead figures stay comparable with earlier
+        # reports; see the deals-worked block above.
+        "deals_worked": len(deals_worked),
+        "deals_worked_by_person": by_person(deals_worked),
+        "deal_new_worked": len(deal_new_worked),
+        "deal_followups": len(deal_followups),
+        "deals_converted": len(deals_new),
+        "deals_by_person": tally(
+            deals_new, lambda d: normalise_person(d.get("Done_By"))),
         "proposals": len(proposals),
         "proposals_by_person": tally(
             proposals, lambda p: normalise_person(p.get("Proposal_Sender_Name"))),
-        "surveys_scheduled": sum(1 for e in events if _is_survey(e)),
-        "meetings_done": sum(1 for e in events if not _is_survey(e)),
-        "meetings_tomorrow": sum(1 for e in tomorrow if not _is_survey(e)),
+        "surveys_scheduled": sum(1 for e in events if _meeting_type(e) == "survey"),
+        "meetings_done": sum(1 for e in events if _meeting_type(e) != "survey"),
+        "meetings_tomorrow": sum(1 for e in tomorrow
+                                 if _meeting_type(e) != "survey"),
+        "surveys_tomorrow": sum(1 for e in tomorrow
+                                if _meeting_type(e) == "survey"),
+        # Meetings with no Meeting Type set and nothing survey-like in the
+        # title. Counted as client meetings above; surfaced here so the report
+        # can say how much of the split is inferred rather than recorded.
+        "meetings_unclassified": sum(1 for e in events
+                                     if _meeting_type(e) == "unclassified"),
         "leads": len(leads),
         "leads_by_status": status,
-        "ladder": {k: status.get(k, 0) for k in LADDER},
     }
 
 
-def build_shift_data(db_path: str, now: datetime | None = None) -> dict:
+def ladder_by_month(idx, since: datetime, until: datetime):
+    """One bucket per calendar month from `since` to `until`.
+
+    Each bucket counts leads CREATED in that month that are still sitting in one
+    of the four states now. So a month's bar falling over time is the team
+    clearing that cohort, not fewer leads having arrived.
+    """
+    months = []
+    y, m = since.year, since.month
+    while (y, m) <= (until.year, until.month):
+        months.append((y, m))
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+
+    buckets = {ym: {k: 0 for k in LADDER} for ym in months}
+    arrived = {ym: 0 for ym in months}
+    earliest = None
+    for when, lead in idx["leads"]:
+        if not when:
+            continue
+        if earliest is None or when < earliest:
+            earliest = when
+        ym = (when.year, when.month)
+        if ym not in buckets:
+            continue
+        arrived[ym] += 1
+        st = (lead.get("Lead_Status") or "").strip()
+        if st in buckets[ym]:
+            buckets[ym][st] += 1
+
+    # A month with no leads at all that also sits before the oldest lead in the
+    # snapshot is not a quiet month — it is a month the sync never reached. Say
+    # so, rather than drawing four zeros that read as an intake collapse.
+    floor = (earliest.year, earliest.month) if earliest else None
+
+    out = []
+    for ym in months:
+        counts = buckets[ym]
+        covered = floor is None or ym >= floor or arrived[ym] > 0
+        out.append({
+            "label": datetime(ym[0], ym[1], 1).strftime("%b"),
+            "year": ym[0],
+            "counts": counts,
+            "stuck": sum(counts.values()),
+            "arrived": arrived[ym],
+            "covered": covered,
+        })
+    return out
+
+
+def ladder_backlog(idx, since: datetime):
+    """Every lead created since `since` still sitting in one of the four states.
+
+    Cumulative, not window-scoped, and read from each lead's status as it stands
+    now. This is the queue the team has to clear, not a measure of the shift.
+    """
+    counts = {k: 0 for k in LADDER}
+    oldest = None
+    total = 0
+    for when, lead in idx["leads"]:
+        if not when or when < since:
+            continue
+        total += 1
+        st = (lead.get("Lead_Status") or "").strip()
+        if st in counts:
+            counts[st] += 1
+            if oldest is None or when < oldest:
+                oldest = when
+    return {"counts": counts, "since": since, "leads_seen": total,
+            "oldest_stuck": oldest, "stuck": sum(counts.values())}
+
+
+def deal_aging(deals, now: datetime):
+    """Open deals by stage, bucketed by age.
+
+    Age runs from the deal's creation — the day the lead converted. The CRM
+    keeps no stage-change timestamp, so how long a deal has sat in its current
+    stage cannot be measured; age since conversion is the closest honest
+    figure. `idle` counts deals with no activity for DEAL_IDLE_DAYS or more,
+    which is what separates an old deal still being worked from a stalled one.
+
+    Like the backlog, this is the standing pipeline, not scoped to a window.
+    """
+    closed = WON_STAGES | LOST_STAGES
+    rows = {}
+    for d in deals:
+        stage = (d.get("Stage") or "").strip() or "Not set"
+        created = _dt(d.get("Created_Time"))
+        if stage.lower() in closed or not created:
+            continue
+        age = max(0, (now - created).days)
+        r = rows.setdefault(stage, {"buckets": {b[0]: 0 for b in DEAL_AGE_BUCKETS},
+                                    "total": 0, "idle": 0, "oldest": 0})
+        for label, lo, hi in DEAL_AGE_BUCKETS:
+            if age >= lo and (hi is None or age <= hi):
+                r["buckets"][label] += 1
+                break
+        r["total"] += 1
+        r["oldest"] = max(r["oldest"], age)
+        last = _activity_at(d)
+        if not last or (now - last).days >= DEAL_IDLE_DAYS:
+            r["idle"] += 1
+
+    order = ([s for s in DEAL_STAGES if s in rows]
+             + sorted(s for s in rows if s not in DEAL_STAGES))
+    return {"stages": [(s, rows[s]) for s in order]}
+
+
+def build_shift_data(db_path: str, now: datetime | None = None,
+                     start: datetime | None = None) -> dict:
+    """Build the report payload.
+
+    `start` overrides the computed window start, so a caller can ask for an
+    arbitrary span — a whole day, say — rather than the scheduled shift window.
+    The two comparison columns still shift back by one and two days, keeping
+    like-for-like.
+    """
     data = load_records(db_path)
     idx = _index(data)
     now = now or datetime.now(IST)
-    start, end = window_for(now)
+    if start is not None:
+        start, end = start, now
+    else:
+        start, end = window_for(now)
 
     windows = [(start, end)]
     for back in (1, 2):
         windows.append((start - timedelta(days=back), end - timedelta(days=back)))
 
+    try:
+        y, m, d = (int(x) for x in str(settings.LADDER_SINCE).split("-")[:3])
+        since = IST.localize(datetime(y, m, d))
+    except Exception:
+        log.error("Bad LADDER_SINCE %r — falling back to 1 Jan 2026.",
+                  settings.LADDER_SINCE)
+        since = IST.localize(datetime(2026, 1, 1))
+
     return {
         "windows": [window_metrics(idx, s, e) for s, e in windows],
+        "ladder": ladder_backlog(idx, since),
+        "ladder_months": ladder_by_month(idx, since, now),
+        "deal_aging": deal_aging(data.get("Deals", []), now),
         "events_synced": len(data.get("Events", [])),
         "snapshot_at": snapshot_time(db_path),
         "generated_at": now,
@@ -225,75 +522,68 @@ def build_shift_data(db_path: str, now: datetime | None = None) -> dict:
 
 # ── the chart ─────────────────────────────────────────────────────────
 
+
+
 class LadderChart(Flowable):
-    """Horizontal bars for the four escalation statuses.
+    """Horizontal bars for the standing lead backlog by escalation stage.
 
     Bars stay in escalation order rather than sorted by size, because the order
     is the information. Every bar is labelled, so identity never rests on colour
-    alone and the chart still reads if printed in black and white.
+    alone and the chart still reads printed in black and white.
     """
 
-    def __init__(self, current: dict, previous: dict, width=170 * mm, row=13):
+    def __init__(self, counts: dict, width=170 * mm, row=15):
         super().__init__()
-        self.cur, self.prev = current, previous
+        self.counts = counts
         self.width = width
         self.row = row
-        self.height = row * len(LADDER) + 20
+        self.height = row * len(LADDER) + 22
 
     def draw(self):
         c = self.canv
-        label_w, right_w = 34 * mm, 30 * mm
+        label_w, right_w = 34 * mm, 34 * mm
         plot_w = self.width - label_w - right_w
-        top = self.height - 14
-        peak = max([self.cur.get(k, 0) for k in LADDER] +
-                   [self.prev.get(k, 0) for k in LADDER] + [1])
+        top = self.height - 16
+        total = sum(self.counts.get(k, 0) for k in LADDER)
+        peak = max([self.counts.get(k, 0) for k in LADDER] + [1])
 
         c.setFont("Helvetica-Bold", 7.2)
         c.setFillColor(MUTE)
-        c.drawString(0, self.height - 8, "LEADS IN THIS WINDOW BY STATUS")
+        c.drawString(0, self.height - 9, "LEADS WAITING, BY STAGE")
         c.setFont("Helvetica", 7.2)
-        c.drawRightString(self.width, self.height - 8, "faint bar = same window yesterday")
+        c.drawRightString(self.width, self.height - 9, f"{total:,} in total")
 
-        # recessive gridlines, so magnitude is readable without a heavy axis
         c.setStrokeColor(GRID)
         c.setLineWidth(0.4)
         for frac in (0.25, 0.5, 0.75, 1.0):
             x = label_w + plot_w * frac
-            c.line(x, top - self.row * len(LADDER) + 3, x, top + 3)
+            c.line(x, top - self.row * len(LADDER) + 4, x, top + 4)
 
         for i, key in enumerate(LADDER):
-            y = top - (i + 1) * self.row + 3
-            now_v, was_v = self.cur.get(key, 0), self.prev.get(key, 0)
+            y = top - (i + 1) * self.row + 4
+            v = self.counts.get(key, 0)
 
-            c.setFont("Helvetica", 8.2)
+            c.setFont("Helvetica", 8.6)
             c.setFillColor(INK)
-            c.drawString(0, y + 1.5, key)
+            c.drawString(0, y + 2, key)
 
-            # yesterday, as a thin ghost behind today
-            if was_v:
-                c.setFillColor(colors.HexColor("#e9edf1"))
-                c.roundRect(label_w, y - 1, max(1.2, plot_w * was_v / peak), 3, 1.5,
-                            stroke=0, fill=1)
-
-            if now_v:
+            if v:
                 c.setFillColor(LADDER_FILL[i])
-                c.roundRect(label_w, y + 2.5, max(1.6, plot_w * now_v / peak), 6.5, 2,
+                c.roundRect(label_w, y, max(1.8, plot_w * v / peak), 9, 2.5,
                             stroke=0, fill=1)
 
-            c.setFont("Helvetica-Bold", 8.6)
-            c.setFillColor(ZERO if now_v == 0 else INK)
-            c.drawString(label_w + plot_w + 4, y + 1.5, f"{now_v:,}")
+            c.setFont("Helvetica-Bold", 9)
+            c.setFillColor(ZERO if v == 0 else INK)
+            c.drawString(label_w + plot_w + 5, y + 2, f"{v:,}")
 
-            if was_v or now_v:
-                delta = now_v - was_v
+            if total:
                 c.setFont("Helvetica", 7.4)
                 c.setFillColor(MUTE)
-                c.drawString(label_w + plot_w + 16,
-                             y + 1.5, f"({delta:+d} vs yest.)" if delta else "(no change)")
+                c.drawString(label_w + plot_w + 22, y + 2, f"{v / total * 100:.0f}%")
 
         c.setStrokeColor(LINE)
         c.setLineWidth(0.6)
-        c.line(label_w, top - self.row * len(LADDER) + 3, label_w, top + 3)
+        c.line(label_w, top - self.row * len(LADDER) + 4, label_w, top + 4)
 
 
 # ── PDF ───────────────────────────────────────────────────────────────
@@ -316,7 +606,7 @@ def _hdr(wins):
     return out
 
 
-def _table(rows, widths, flag_zero=True):
+def _table(rows, widths, flag_zero=True, bold_first_col=True):
     t = Table(rows, colWidths=widths)
     last = len(rows) - 1
     cmds = [
@@ -327,7 +617,6 @@ def _table(rows, widths, flag_zero=True):
         ("FONTSIZE", (0, 1), (-1, -1), 8.6),
         ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
-        ("FONTNAME", (1, 1), (1, -1), "Helvetica-Bold"),
         ("LINEBELOW", (0, 1), (-1, last - 1), 0.4, LINE),
         ("LINEABOVE", (0, last), (-1, last), 0.9, INK),
         ("FONTNAME", (0, last), (-1, last), "Helvetica-Bold"),
@@ -335,6 +624,10 @@ def _table(rows, widths, flag_zero=True):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
     ]
+    # In the window tables the first data column is today, so it carries the
+    # emphasis. The month table has no such column and stays even.
+    if bold_first_col:
+        cmds.append(("FONTNAME", (1, 1), (1, -1), "Helvetica-Bold"))
     if flag_zero:
         for r in range(1, last):
             if rows[r][1] == "0":
@@ -387,29 +680,117 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
 
     # headline
     rows = [_hdr(wins)]
-    for lbl, key in [("Calls made", "calls"), ("Follow-up calls", "followups"),
-                     ("Proposals sent", "proposals"), ("New leads", "leads"),
-                     ("Surveys scheduled", "surveys_scheduled"),
-                     ("Client meetings done", "meetings_done"),
-                     ("Meetings scheduled tomorrow", "meetings_tomorrow")]:
+    for lbl, key in [("Calls made", "calls"),
+                     ("...follow-up calls", "followups"),
+                     ("...first contact", "first_contact"),
+                     ("Leads touched, any activity", "leads_worked"),
+                     ("Deals worked", "deals_worked"),
+                     ("...converted this window", "deal_new_worked"),
+                     ("...follow-ups", "deal_followups"),
+                     ("Proposals sent", "proposals"),
+                     ("Deals converted", "deals_converted"),
+                     ("New leads", "leads"),
+                     ("Surveys", "surveys_scheduled"),
+                     ("Client meetings", "meetings_done"),
+                     ("Client meetings tomorrow", "meetings_tomorrow"),
+                     ("Surveys tomorrow", "surveys_tomorrow")]:
         rows.append([lbl] + [f"{w.get(key, 0):,}" for w in wins])
     rows.append(["", "", "", ""])
     story.append(_table(rows, W))
 
-    # the chart
-    story.append(Paragraph("Lead status in this window", sec))
-    story.append(LadderChart(w1["ladder"], wins[1]["ladder"]))
+    # month-by-month first, then the cumulative view
+    months = rep.get("ladder_months") or []
+    if months:
+        story.append(Paragraph("Lead backlog by month of arrival", sec))
+        story.append(Paragraph(
+            "Newest month first. Each row is that month's intake and how much of it "
+            "is still waiting now &mdash; so a row falling over time is the team "
+            "clearing that cohort, not fewer leads having arrived. "
+            "<b>Arrived</b> is every lead created that month; <b>Waiting</b> is how "
+            "many of them still sit in one of the four states.", note))
+        story.append(Spacer(1, 4))
+
+        mrows = [["Month", "Not Rated", "Missed 1", "Missed 2", "Missed 3",
+                  "Waiting", "Arrived"]]
+        tot = {k: 0 for k in LADDER}
+        tot_wait = tot_arr = 0
+        for mo in reversed(months):          # August down to January
+            label = f"{mo['label']} {mo['year']}"
+            if not mo.get("covered", True):
+                mrows.append([label, "—", "—", "—", "—", "no data", "—"])
+                continue
+            mrows.append([label] + [f"{mo['counts'].get(k, 0):,}" for k in LADDER]
+                         + [f"{mo['stuck']:,}", f"{mo['arrived']:,}"])
+            for k in LADDER:
+                tot[k] += mo["counts"].get(k, 0)
+            tot_wait += mo["stuck"]
+            tot_arr += mo["arrived"]
+        mrows.append(["Total"] + [f"{tot[k]:,}" for k in LADDER]
+                     + [f"{tot_wait:,}", f"{tot_arr:,}"])
+
+        first = 30 * mm
+        rest = (180 * mm - first) / 6
+        story.append(_table(mrows, [first] + [rest] * 6,
+                            flag_zero=False, bold_first_col=False))
+        story.append(Spacer(1, 8))
+
+    # the chart — standing backlog, not this window
+    lad = rep["ladder"]
+    story.append(Paragraph("Lead backlog — all months combined", sec))
+    story.append(LadderChart(lad["counts"]))
     story.append(Spacer(1, 4))
+    oldest = lad.get("oldest_stuck")
     story.append(Paragraph(
-        "Shaded darker as the escalation deepens. These are the statuses of leads that "
-        "arrived <i>in this window</i>, as they stand now — a lead created this morning "
-        "and missed three times by evening appears under Missed 3, not Not Rated.", note))
+        f"Every lead created since <b>{lad['since']:%d %B %Y}</b> that still sits in one of "
+        f"these four states &mdash; <b>{lad['stuck']:,}</b> of the {lad['leads_seen']:,} "
+        f"created in that period. Shaded darker as the escalation deepens. "
+        + (f"The oldest has been waiting since {oldest:%d %b %Y}. " if oldest else "") +
+        "This is the only figure on the page that is not window-scoped: it is the queue "
+        "the team has to clear, not a measure of the last few hours.", note))
+
+    # open deals by stage and age — standing pipeline, like the backlog
+    aging = (rep.get("deal_aging") or {}).get("stages") or []
+    if aging:
+        labels = [b[0] for b in DEAL_AGE_BUCKETS]
+        arows = [["Stage"] + [f"{l}\ndays" for l in labels]
+                 + ["Total", f"Idle\n{DEAL_IDLE_DAYS}d+", "Oldest\n(days)"]]
+        tot = {l: 0 for l in labels}
+        tot_all = tot_idle = oldest = 0
+        for stage, r in aging:
+            arows.append([stage] + [f"{r['buckets'][l]:,}" for l in labels]
+                         + [f"{r['total']:,}", f"{r['idle']:,}", f"{r['oldest']:,}"])
+            for l in labels:
+                tot[l] += r["buckets"][l]
+            tot_all += r["total"]
+            tot_idle += r["idle"]
+            oldest = max(oldest, r["oldest"])
+        arows.append(["Total"] + [f"{tot[l]:,}" for l in labels]
+                     + [f"{tot_all:,}", f"{tot_idle:,}", f"{oldest:,}"])
+        first = 34 * mm
+        rest = (180 * mm - first) / (len(labels) + 3)
+        story.append(KeepTogether([
+            Paragraph("Open deals by stage and age", sec),
+            Paragraph(
+                "Every deal not yet Closed Won or Closed Lost, by its current stage. "
+                "<b>Age</b> is days since the deal was created &mdash; the day the lead "
+                "converted. The CRM does not record when a deal entered its current "
+                "stage, so time-in-stage cannot be shown. "
+                f"<b>Idle</b> counts deals with no activity for {DEAL_IDLE_DAYS} days or "
+                "more: an old deal that is idle has stalled, an old deal that is not is "
+                "still being worked. Not window-scoped &mdash; this is the whole open "
+                "pipeline as of this report.", note),
+            Spacer(1, 4),
+            _table(arows, [first] + [rest] * (len(labels) + 3), flag_zero=False, bold_first_col=False),
+        ]))
+        story.append(Spacer(1, 8))
 
     # per-person blocks
     for title, key, unattr in [
-        ("Calls made — by person", "calls_by_person", True),
-        ("Follow-up calls — by person", "followups_by_person", True),
+        ("Calls made — by person", "calls_by_person", False),
+        ("Follow-up calls — by person", "followups_by_person", False),
+        ("Deals worked — by person", "deals_worked_by_person", False),
         ("Proposals sent — by person", "proposals_by_person", False),
+        ("Deals converted — by person", "deals_by_person", False),
     ]:
         names = _people(wins, key)
         if not unattr:
@@ -428,8 +809,17 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
         story.append(Paragraph(
             "<b>Surveys and meetings read zero because nothing is logged in the Zoho "
             "Meetings module</b> — not because none happened. They begin counting the day "
-            "the team starts logging. Put <i>Survey</i> or <i>Site Visit</i> in the title "
-            "so surveys separate from ordinary meetings.", note))
+            "the team starts logging. Set <b>Meeting Type</b> to <i>Survey</i> or "
+            "<i>Client Discussion</i> when creating the meeting; that picklist is what "
+            "splits these rows.", note))
+    elif any(w.get("meetings_unclassified") for w in wins):
+        n = wins[0].get("meetings_unclassified", 0)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            f"<b>{n} meeting{'s' if n != 1 else ''} in this window had no Meeting Type "
+            f"set</b> and nothing survey-like in the title, so {'they were' if n != 1 else 'it was'} "
+            f"counted as {'client meetings' if n != 1 else 'a client meeting'}. Setting the "
+            f"picklist when the meeting is created removes the guesswork.", note))
 
     story.append(Spacer(1, 10))
     story.append(Paragraph(
@@ -438,10 +828,38 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
         "report covers the working shift since 11:00. Because those windows differ in "
         "length, they are never compared against each other — only against the same window "
         "on earlier days. "
-        "<b>Calls by person</b> is attributed through Done By on the linked lead or deal "
-        "and is approximate; what cannot be traced is listed as Not attributable rather "
-        "than shared out. <b>Proposals by person</b> is exact. Proposals are placed in a "
-        "window by record creation time, since Proposal Date carries no time of day.", note))
+        "<b>Where Calls made comes from.</b> It is counted from the Leads module, not "
+        "the Calls module. A call is a lead whose last activity falls in this window and "
+        "which carries a Latest Call Action — Missed, Interested, Call Back, Not "
+        "Interested and so on — which the team sets every time they ring someone. Between "
+        "92% and 99% of leads touched on any day carry one. The Calls module is not used, "
+        "because on a typical day two thirds of its records sit at Overdue: the call was "
+        "scheduled, the call was made, and the record was never closed. Counting it would "
+        "have understated the team's work by more than half. "
+        "<b>The known limit</b> is that this counts leads, not dials: a lead rung twice in "
+        "the same window counts once, so the true number of dials is somewhat higher. "
+        "<b>Follow-up</b> means the lead existed before this window; <b>first contact</b> "
+        "means it was created inside it. Together they equal Calls made. "
+        "<b>Leads touched</b> is every lead worked including those with no call outcome "
+        "recorded; the gap between it and Calls made is activity that was not logged as a "
+        "call. <b>Deals worked</b> is every open deal whose last activity falls in the "
+        "window, matching Zoho's Deals chart on Last Activity Time grouped by Done By. It "
+        "is not part of Calls made. It splits into deals <b>converted this window</b> "
+        "(a converted lead leaves the Leads module, so that call is counted here and "
+        "nowhere else) and <b>follow-ups</b> on deals that already existed. Deals now at "
+        "Closed Won or Closed Lost are left out because their last activity is taken to "
+        "be the closing. "
+        "<b>By person</b> uses Done By on the lead or deal, which holds the most recent "
+        "actor — so a lead worked by two people in one window credits only the second. "
+        "<b>Proposals by person</b> is exact, and proposals are placed in a window by "
+        "record creation time since Proposal Date carries no time of day. "
+        "<b>Deals converted</b> counts deals created in the window, credited to Done By. "
+        "There is no conversion timestamp in this CRM — Zoho Lead ID is empty on every "
+        "deal and Lead Conversion Time holds a number of days rather than a date — so "
+        "deal creation is what places a conversion in time. "
+        "<b>The backlog chart is the exception</b> to everything above: it counts every "
+        "lead since the start date regardless of window, which is why its numbers are so "
+        "much larger than the columns.", note))
     story.append(Spacer(1, 5))
     story.append(Paragraph(
         f"Data snapshot: {snap:%d %b %Y %H:%M IST} &nbsp;·&nbsp; generated "
@@ -463,14 +881,26 @@ def _body_text(rep):
         "Compared with the same window on the previous two days.",
         "", f"{'Metric':28}{hdr}", "-" * 70,
     ]
-    for lbl, key in [("Calls made", "calls"), ("Follow-up calls", "followups"),
-                     ("Proposals sent", "proposals"), ("New leads", "leads"),
-                     ("Surveys scheduled", "surveys_scheduled"),
-                     ("Client meetings done", "meetings_done")]:
+    for lbl, key in [("Calls made", "calls"),
+                     ("...follow-up calls", "followups"),
+                     ("...first contact", "first_contact"),
+                     ("Leads touched", "leads_worked"),
+                     ("Deals worked", "deals_worked"),
+                     ("...converted this window", "deal_new_worked"),
+                     ("...follow-ups", "deal_followups"),
+                     ("Proposals sent", "proposals"),
+                     ("Deals converted", "deals_converted"),
+                     ("New leads", "leads"),
+                     ("Surveys", "surveys_scheduled"),
+                     ("Client meetings", "meetings_done"),
+                     ("Client meetings tomorrow", "meetings_tomorrow"),
+                     ("Surveys tomorrow", "surveys_tomorrow")]:
         out.append(f"{lbl:28}" + "".join(f"{w.get(key,0):>14,}" for w in wins))
-    out += ["", "Lead status in this window", "-" * 70]
+    lad = rep["ladder"]
+    out += ["", f"Lead backlog since {lad['since']:%d %b %Y} "
+                f"({lad['stuck']:,} still waiting)", "-" * 70]
     for k in LADDER:
-        out.append(f"{k:28}" + "".join(f"{(w.get('ladder') or {}).get(k,0):>14,}" for w in wins))
+        out.append(f"{k:28}{lad['counts'].get(k, 0):>14,}")
     out += ["", "Full per-person breakdowns are in the attached PDF.", "", config.COMPANY_NAME]
     return "\n".join(out)
 
@@ -491,8 +921,13 @@ def _body_html(rep):
         return (f'<tr><td style="padding:6px 10px;border-bottom:1px solid #eee;font-size:13px;'
                 f'font-weight:{"600" if strong else "400"};">{label}</td>{cells}</tr>')
 
+    lad = rep["ladder"]
     ladder_rows = "".join(
-        row(k, [(w.get("ladder") or {}).get(k, 0) for w in wins]) for k in LADDER)
+        f'<tr><td style="padding:6px 10px;border-bottom:1px solid #eee;font-size:13px;">{k}</td>'
+        f'<td style="padding:6px 10px;border-bottom:1px solid #eee;font-size:13px;'
+        f'text-align:right;font-weight:700;color:'
+        f'{"#9c2b28" if lad["counts"].get(k, 0) == 0 else "#1a3c5e"};">'
+        f'{lad["counts"].get(k, 0):,}</td></tr>' for k in LADDER)
 
     return f"""<!DOCTYPE html><html><body style="margin:0;padding:20px;background:#f0f4f8;font-family:Arial,Helvetica,sans-serif;">
 <div style="max-width:660px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #e2e5ea;">
@@ -506,15 +941,26 @@ def _body_html(rep):
     <table style="width:100%;border-collapse:collapse;">
       <tr><th style="text-align:left;font-size:11px;color:#888;padding:0 10px 6px;border-bottom:2px solid #16324f;">This window</th>{hdr}</tr>
       {row('Calls made', [w['calls'] for w in wins], True)}
-      {row('Follow-up calls', [w['followups'] for w in wins], True)}
+      {row('&hellip;follow-up calls', [w['followups'] for w in wins], True)}
+      {row('&hellip;first contact', [w['first_contact'] for w in wins], True)}
+      {row('Leads touched', [w['leads_worked'] for w in wins], True)}
+      {row('Deals worked', [w['deals_worked'] for w in wins], True)}
+      {row('&hellip;converted this window', [w['deal_new_worked'] for w in wins], True)}
+      {row('&hellip;follow-ups', [w['deal_followups'] for w in wins], True)}
       {row('Proposals sent', [w['proposals'] for w in wins], True)}
+      {row('Deals converted', [w['deals_converted'] for w in wins], True)}
       {row('New leads', [w['leads'] for w in wins], True)}
-      {row('Surveys scheduled', [w['surveys_scheduled'] for w in wins], True)}
-      {row('Client meetings done', [w['meetings_done'] for w in wins], True)}
+      {row('Surveys', [w['surveys_scheduled'] for w in wins], True)}
+      {row('Client meetings', [w['meetings_done'] for w in wins], True)}
+      {row('Client meetings tomorrow', [w['meetings_tomorrow'] for w in wins], True)}
+      {row('Surveys tomorrow', [w['surveys_tomorrow'] for w in wins], True)}
     </table>
-    <h3 style="color:#16324f;font-size:13px;margin:18px 0 8px;">Lead status in this window</h3>
+    <h3 style="color:#16324f;font-size:13px;margin:18px 0 8px;">
+      Lead backlog since {lad['since']:%d %b %Y} &mdash; {lad['stuck']:,} still waiting
+    </h3>
     <table style="width:100%;border-collapse:collapse;">
-      <tr><th style="text-align:left;font-size:11px;color:#888;padding:0 10px 6px;border-bottom:2px solid #16324f;">Status</th>{hdr}</tr>
+      <tr><th style="text-align:left;font-size:11px;color:#888;padding:0 10px 6px;border-bottom:2px solid #16324f;">Stage</th>
+          <th style="text-align:right;font-size:11px;color:#888;padding:0 10px 6px;border-bottom:2px solid #16324f;">Leads</th></tr>
       {ladder_rows}
     </table>
     <p style="font-size:12px;color:#666;margin:16px 0 0;">
@@ -532,7 +978,7 @@ def _body_html(rep):
 def send_shift_report(now=None) -> str | None:
     try:
         import crm_sync
-        crm_sync.sync()
+        crm_sync.sync(days=settings.SYNC_DAYS)
     except Exception as exc:
         log.error("Snapshot refresh failed (%s) — using existing snapshot.", exc)
 

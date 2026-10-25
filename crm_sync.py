@@ -23,12 +23,13 @@ from datetime import datetime, timedelta
 import pytz
 import requests
 
-import config
+import settings as config
+import settings
 
 log = logging.getLogger("crm_sync")
 
 IST = pytz.timezone("Asia/Kolkata")
-DB_PATH = "hrp_crm.db"
+DB_PATH = settings.DB_PATH
 
 # COQL caps a single response at 200 rows; we page with OFFSET inside each
 # time chunk, and chunk by week so no single chunk approaches the offset cap.
@@ -83,6 +84,11 @@ MODULES = {
             # per-person attribution: staff are off-roll and share one Zoho
             # login, so the real actor is in Done_By, not Owner.
             "Done_By", "Latest_Call_Action", "Next_Follow_up", "Pending_at",
+            # Zoho's own "Last Activity Time" — the field the CRM's built-in
+            # charts filter on. It moves when a lead is actually worked, and
+            # unlike Modified_Time it is not disturbed by workflow rules or
+            # bulk edits. "Leads worked" is counted from this.
+            "Last_Activity_Time",
         ],
     },
     "Calls": {
@@ -135,6 +141,7 @@ MODULES = {
             "Installation_Type", "Cost_kWp", "Customer_Type",
             "Next_Follow_Up", "Zoho_Lead_ID",
             "Done_By", "Latest_Call_Action", "Next_Action", "Pending_at",
+            "Last_Activity_Time",
         ],
     },
 }

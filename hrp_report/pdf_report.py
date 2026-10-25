@@ -31,6 +31,7 @@ SECTIONS = [
         ("junk_pct_of_days_leads", "…junk rate", "pct", -1),
     ]),
     ("Contact discipline", [
+        ("leads_worked", "Leads worked (last activity)", "int", 1),
         ("calls_logged", "Call records logged", "int", 0),
         ("calls", "…calls that actually happened", "int", 1),
         ("calls_missed", "…scheduled but not made", "int", -1),

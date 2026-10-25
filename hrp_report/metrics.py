@@ -253,6 +253,17 @@ def _never_called_backlog(idx, upto: date) -> int:
     return n
 
 
+def _activity_day(rec):
+    """The day a record was last actually worked.
+
+    Zoho's built-in Leads charts filter on Last Activity Time, which moves when
+    someone calls, emails or re-statuses a lead. Modified_Time is the fallback
+    for records synced before that field was added; it is looser, because a
+    workflow rule or bulk edit moves it with no human involved.
+    """
+    return _day(rec.get("Last_Activity_Time")) or _day(rec.get("Modified_Time"))
+
+
 def day_metrics(idx, day: date) -> dict:
     leads = idx["leads_by_day"].get(day, [])
     calls = idx["calls_by_day"].get(day, [])
@@ -334,8 +345,11 @@ def day_metrics(idx, day: date) -> dict:
     # second, and repeat touches collapse to one.
     actioned = [
         l for l in idx["leads"]
-        if _day(l.get("Modified_Time")) == day and normalise_person(l.get("Done_By")) != "Not recorded"
+        if _activity_day(l) == day and normalise_person(l.get("Done_By")) != "Not recorded"
     ]
+    # Every lead touched that day regardless of whether Done By is filled in.
+    # This is the figure Zoho's own Leads chart shows for Last Activity Time.
+    worked = [l for l in idx["leads"] if _activity_day(l) == day]
 
     breakdowns = {
         "proposals_by_user": tally(proposals, _sender),
@@ -366,6 +380,7 @@ def day_metrics(idx, day: date) -> dict:
         **breakdowns,
         "date": day,
         "new_leads": len(leads),
+        "leads_worked": len(worked),
         "calls_logged": len(calls),
         "deal_calls": len(deal_calls),
         "lead_calls": len(lead_calls),

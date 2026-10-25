@@ -72,11 +72,29 @@ DATA_DIR = _get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = _get("DB_PATH", os.path.join(DATA_DIR, "hrp_crm.db"))
 REPORTS_DIR = _get("REPORTS_DIR", os.path.join(DATA_DIR, "reports"))
 
+# ── Data window ───────────────────────────────────────────────────────
+# How far back each sync pulls. The lead-status chart counts every lead since
+# LADDER_SINCE, so SYNC_DAYS must reach at least that far or the early months
+# are simply absent and the chart silently understates the backlog.
+SYNC_DAYS = _get("SYNC_DAYS", 300, int)
+LADDER_SINCE = _get("LADDER_SINCE", "2026-01-01")
+
 # ── Schedules (IST). Change these to move a report's time. ────────────
 MORNING_AT = _get("MORNING_AT", "08:00")
 # The shift report runs twice a day. Each run covers the interval since the
 # previous one, so the two together tile the day with no gap and no overlap.
 SHIFT_TIMES = _get("SHIFT_TIMES", ["11:00", "20:00"], list)
+# By default a shift window starts at the previous boundary, so the 20:00 run
+# would cover 11:00-20:00. That is not the working day. This overrides the
+# start for a given run time: "20:00=09:00" makes the day-end report cover
+# 09:00 to 20:00 regardless of when the earlier report ran.
+#
+# NOTE this deliberately creates an overlap: the 11:00 report covers 20:00
+# yesterday to 11:00 today, so 09:00-11:00 appears in both editions. That is
+# the price of the evening report describing a whole working day, and it is
+# stated on the face of the PDF.
+SHIFT_WINDOW_STARTS = _get("SHIFT_WINDOW_STARTS", ["20:00=09:00"], list)
+
 EVENING_AT = _get("EVENING_AT", "18:30")   # legacy single-run report
 HEALTHCHECK_AT = _get("HEALTHCHECK_AT", "21:00")
 TIMEZONE = _get("TIMEZONE", "Asia/Kolkata")
@@ -95,6 +113,8 @@ def summary() -> str:
         f"CRM base {ZOHO_CRM_BASE} | token {mask(REFRESH_TOKEN)} | "
         f"transport {MAIL_TRANSPORT} | from {SMTP_FROM or 'MISSING'} | "
         f"{len(RECIPIENTS)} recipients | alerts to {len(ALERT_TO) or 'derived'} | "
-        f"db {DB_PATH} | morning {MORNING_AT} | shifts {','.join(SHIFT_TIMES)} | "
+        f"db {DB_PATH} | sync {SYNC_DAYS}d | ladder since {LADDER_SINCE} | "
+        f"morning {MORNING_AT} | shifts {','.join(SHIFT_TIMES)} | "
+        f"window starts {','.join(SHIFT_WINDOW_STARTS) or 'default'} | "
         f"health {HEALTHCHECK_AT} | {TIMEZONE}"
     )
