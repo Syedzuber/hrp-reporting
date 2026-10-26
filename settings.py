@@ -77,6 +77,10 @@ WHATSAPP_TO = _get("WHATSAPP_TO", [], list)       # 10-digit mobiles, comma-sepa
 # Codenames are global to the shared WhatsApp number, hence crm_ and _v1.
 WHATSAPP_TEMPLATE_DAYSTART = _get("WHATSAPP_TEMPLATE_DAYSTART", "crm_day_start_v1")
 WHATSAPP_TEMPLATE_SHIFT = _get("WHATSAPP_TEMPLATE_SHIFT", "crm_shift_evening_v1")
+# Log Interakt's full raw response at INFO, to confirm its format on the first
+# sends. The body may contain the recipient's number: turn this off once the
+# format is confirmed and the success check in hrp_report/whatsapp.py tightened.
+WHATSAPP_LOG_RESPONSES = _get("WHATSAPP_LOG_RESPONSES", True, bool)
 
 # ── Storage ───────────────────────────────────────────────────────────
 # On Railway this points at the mounted volume so the database survives

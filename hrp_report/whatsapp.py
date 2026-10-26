@@ -128,11 +128,50 @@ def build_payload(kind: str, number: str, values: list) -> dict:
     }
 
 
+def _is_false(value) -> bool:
+    return value is False or str(value).strip().lower() == "false"
+
+
+def _failure_marker(body) -> str | None:
+    """The explicit failure marker in a response body, or None if there is none."""
+    if not isinstance(body, dict):
+        return None
+    for key in ("result", "success"):
+        if key in body and _is_false(body[key]):
+            return f'"{key}" is false'
+    for key in ("error", "errors"):
+        if body.get(key):
+            return f'"{key}" is set'
+    return None
+
+
+def _message_id(body) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    for value in (body.get("id"), body.get("messageId"), body.get("message_id"),
+                  data.get("id"), data.get("messageId")):
+        if value:
+            return str(value)
+    return None
+
+
 def post(payload: dict) -> str:
     """Send one message. Returns Interakt's message id; raises WhatsAppError.
 
-    Interakt can answer HTTP 200 with an error in the body, so success is
-    judged from the body ("result": true), not from the status code alone.
+    Interakt's documentation says only that a successful call returns a message
+    id; the full response shape is unconfirmed. So the rule is deliberately
+    lenient:
+
+      * FAILURE if the status is not 2xx;
+      * FAILURE if the body carries an explicit failure marker — "result" or
+        "success" false, or a non-empty "error" or "errors" (Interakt can
+        answer 200 with an error);
+      * SUCCESS otherwise, with the message id logged when one can be found.
+
+    An unrecognised 2xx therefore counts as sent. A false failure raises a
+    false alarm; a missed one is noticed by the recipient getting nothing.
+    Tighten this once WHATSAPP_LOG_RESPONSES has shown the real shape.
     """
     try:
         r = requests.post(API_URL, json=payload, timeout=20,
@@ -140,13 +179,22 @@ def post(payload: dict) -> str:
                                    "Content-Type": "application/json"})
     except Exception as exc:
         raise WhatsAppError(f"Interakt unreachable: {exc}") from exc
+
+    if settings.WHATSAPP_LOG_RESPONSES:
+        # The full raw body, to learn the real format. It may contain the
+        # recipient's number, so turn this off once the format is confirmed.
+        log.info("Interakt raw response (HTTP %s): %s", r.status_code, r.text)
+
     try:
         body = r.json()
     except ValueError:
         body = None
-    if not (200 <= r.status_code < 300) or not isinstance(body, dict) or body.get("result") is not True:
+    if not (200 <= r.status_code < 300):
         raise WhatsAppError(f"Interakt HTTP {r.status_code}: {r.text[:400]}")
-    return str(body.get("id") or "(no id returned)")
+    marker = _failure_marker(body)
+    if marker:
+        raise WhatsAppError(f"Interakt HTTP {r.status_code} but {marker}: {r.text[:400]}")
+    return _message_id(body) or "(no id returned)"
 
 
 # ── the log the healthcheck reads ─────────────────────────────────────
