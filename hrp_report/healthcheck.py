@@ -62,6 +62,10 @@ START_GRACE = timedelta(minutes=15)
 # 300-day sync takes minutes, not hours.
 MAX_RUNTIME = timedelta(hours=2)
 
+# A WhatsApp recipient whose last this-many attempts all failed is alerted on.
+# Two digests a day, so three failures is about a day and a half of silence.
+WHATSAPP_FAILS_BEFORE_ALERT = 3
+
 MORNING_GLOB = "HRP_Daily_Sales_Numbers_*.pdf"
 EVENING_GLOB = "HRP_End_of_Day_*.pdf"
 
@@ -208,6 +212,48 @@ def _database_problems(db, now):
     return problems
 
 
+def _whatsapp_problems(db_path=None):
+    """The digest is secondary and never fails a job, which is exactly why it
+    needs watching: nothing else would notice it had stopped arriving."""
+    if not settings.WHATSAPP_ENABLED:
+        return []
+    if not settings.INTERAKT_API_KEY:
+        return ["WhatsApp: WHATSAPP_ENABLED is on but INTERAKT_API_KEY is not set, so "
+                "no digest is being sent. Copy the key into this service's variables."]
+    if not settings.WHATSAPP_TO:
+        return ["WhatsApp: WHATSAPP_ENABLED is on but WHATSAPP_TO is empty, so no "
+                "digest is being sent."]
+    conn = _open_readonly(db_path or DB_PATH)
+    if conn is None:
+        return []
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='whatsapp_log'").fetchone():
+            return []
+        rows = conn.execute(
+            "SELECT recipient, status, sent_at, report, error FROM whatsapp_log "
+            "WHERE status IN ('ok', 'failed') ORDER BY id DESC").fetchall()
+    finally:
+        conn.close()
+
+    # Per recipient, so one wrong number cannot hide behind the others.
+    recent = {}
+    for recipient, status, sent_at, report, error in rows:
+        recent.setdefault(recipient, [])
+        if len(recent[recipient]) < WHATSAPP_FAILS_BEFORE_ALERT:
+            recent[recipient].append((status, sent_at, report, error))
+    problems = []
+    for recipient, attempts in recent.items():
+        if (len(attempts) == WHATSAPP_FAILS_BEFORE_ALERT
+                and all(a[0] == "failed" for a in attempts)):
+            _, sent_at, report, error = attempts[0]
+            problems.append(
+                f"WhatsApp: the last {WHATSAPP_FAILS_BEFORE_ALERT} digests to {recipient} "
+                f"all failed, most recently the {report} digest at "
+                f"{_when(_ist(sent_at))}: {error}. The emails are unaffected.")
+    return problems
+
+
 def _job_problems(scheduled, runs, now):
     problems = []
     for name, at in scheduled:
@@ -257,6 +303,7 @@ def run_check(force: bool = False, now: datetime | None = None) -> dict:
 
     problems += _database_problems(db, now)
     problems += _job_problems(scheduled, runs, now)
+    problems += _whatsapp_problems()
 
     if settings.MORNING_ENABLED:
         if m_at is None:

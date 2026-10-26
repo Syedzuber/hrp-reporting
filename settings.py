@@ -65,6 +65,19 @@ ZEPTO_TOKEN = _get("ZEPTO_TOKEN") or SMTP_PASSWORD
 # api.zeptomail.com. Your SMTP host is smtp.zeptomail.in, so .in is the default.
 ZEPTO_API_URL = _get("ZEPTO_API_URL", "https://api.zeptomail.in/v1.1/email")
 
+# ── WhatsApp digest (Interakt) ────────────────────────────────────────
+# A secondary digest that follows the email; never a replacement for it.
+# The Interakt account is shared with the PMS, which lives in another Railway
+# project, so the key is copied into this service by hand. Never logged.
+INTERAKT_API_KEY = _get("INTERAKT_API_KEY")
+WHATSAPP_ENABLED = _get("WHATSAPP_ENABLED", False, bool)
+WHATSAPP_TO = _get("WHATSAPP_TO", [], list)       # 10-digit mobiles, comma-separated
+# Settings, not constants: an approved template cannot be edited, so new
+# wording means a new codename, and switching to it is a variable change.
+# Codenames are global to the shared WhatsApp number, hence crm_ and _v1.
+WHATSAPP_TEMPLATE_DAYSTART = _get("WHATSAPP_TEMPLATE_DAYSTART", "crm_day_start_v1")
+WHATSAPP_TEMPLATE_SHIFT = _get("WHATSAPP_TEMPLATE_SHIFT", "crm_shift_evening_v1")
+
 # ── Storage ───────────────────────────────────────────────────────────
 # On Railway this points at the mounted volume so the database survives
 # redeploys. Locally it stays beside the code.
@@ -115,7 +128,9 @@ def summary() -> str:
     return (
         f"CRM base {ZOHO_CRM_BASE} | token {mask(REFRESH_TOKEN)} | "
         f"transport {MAIL_TRANSPORT} | from {SMTP_FROM or 'MISSING'} | "
-        f"{len(RECIPIENTS)} recipients | alerts to {len(ALERT_TO) or 'derived'} | "
+        f"{len(RECIPIENTS)} recipients | alerts to {len(ALERT_TO) or 'MISSING'} | "
+        f"whatsapp {'on' if WHATSAPP_ENABLED else 'off'}, key {mask(INTERAKT_API_KEY)}, "
+        f"{len(WHATSAPP_TO)} numbers | "
         f"db {DB_PATH} | sync {SYNC_DAYS}d | ladder since {LADDER_SINCE} | "
         f"morning {MORNING_AT} | day start {DAYSTART_AT} | shifts {','.join(SHIFT_TIMES)} | "
         f"window starts {','.join(SHIFT_WINDOW_STARTS) or 'default'} | "

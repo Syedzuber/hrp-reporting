@@ -49,7 +49,7 @@ from reportlab.lib import colors
 from reportlab.platypus import KeepTogether, Paragraph, Spacer, TableStyle
 
 import settings
-from . import shift
+from . import shift, whatsapp
 from .metrics import (
     LOST_STAGES, WON_STAGES, SyncFailed, _dt, load_records, normalise_person, snapshot_time,
 )
@@ -276,12 +276,25 @@ def build_daystart_data(db_path: str, now: datetime | None = None,
          and (l.get("Lead_Status") or "").strip().lower() in UNTOUCHED),
         key=lambda r: r["at"])
 
+    # The headline figures, computed once. The PDF's total rows, the email
+    # summary and the WhatsApp digest all read these, so they cannot disagree.
+    open_all = sum(c["open"] for c in coverage.values())
+    headline = {
+        "due_today": sum(v["Leads"] + v["Deals"] for v in commitments.values()),
+        "overdue_week": sum(v["1-3"] + v["4-7"] for v in this_week.values()),
+        "aged_total": sum(aged_by_person.values()),
+        "aged_unassigned": aged_by_person.get(UNASSIGNED, 0),
+        "dated_pct": _pct(sum(c["dated"] for c in coverage.values()), open_all),
+        "current_pct": _pct(sum(c["current"] for c in coverage.values()), open_all),
+    }
+
     snap = snapshot_time(db_path)
     return {
         "today": today,
         "generated_at": now,
         "snapshot_at": snap,
         "sync_ok": sync_ok,
+        "headline": headline,
         # Banner markup when the figures cannot be trusted as current, else None.
         "stale": _stale(snap, now, sync_ok),
         "yesterday": shift.window_metrics(idx, y_from, y_to),
@@ -290,7 +303,7 @@ def build_daystart_data(db_path: str, now: datetime | None = None,
         "commitments": dict(commitments),
         "this_week": dict(this_week),
         "aged": {"by_module": dict(aged), "by_person": aged_by_person,
-                 "total": sum(aged_by_person.values()), "oldest_days": oldest},
+                 "total": headline["aged_total"], "oldest_days": oldest},
         "aged_previous": previous_backlog(db_path, today),
         "coverage": coverage,
         "diary": diary,
@@ -308,8 +321,7 @@ def _coverage_findings(rep):
     """(all-open current %, list of findings as markup)."""
     cov = rep["coverage"]
     lead, deal = cov["Leads"], cov["Deals"]
-    open_all = lead["open"] + deal["open"]
-    cur_all = _pct(lead["current"] + deal["current"], open_all)
+    cur_all = rep["headline"]["current_pct"]
     lead_cur, deal_cur = _pct(lead["current"], lead["open"]), _pct(deal["current"], deal["open"])
 
     out = []
@@ -376,9 +388,10 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
     for name in _names(c):
         v = c.get(name, {"Leads": 0, "Deals": 0})
         rows.append([name, f"{v['Leads']:,}", f"{v['Deals']:,}", f"{v['Leads'] + v['Deals']:,}"])
+    hl = rep["headline"]
     tl = sum(v["Leads"] for v in c.values())
     td = sum(v["Deals"] for v in c.values())
-    rows.append(["Total", f"{tl:,}", f"{td:,}", f"{tl + td:,}"])
+    rows.append(["Total", f"{tl:,}", f"{td:,}", f"{hl['due_today']:,}"])
     story.append(KeepTogether([
         Paragraph("Today's commitments", sec),
         Paragraph(
@@ -398,7 +411,7 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
         rows.append([name, f"{v['1-3']:,}", f"{v['4-7']:,}", f"{v['1-3'] + v['4-7']:,}"])
     a = sum(v["1-3"] for v in w.values())
     b = sum(v["4-7"] for v in w.values())
-    rows.append(["Total", f"{a:,}", f"{b:,}", f"{a + b:,}"])
+    rows.append(["Total", f"{a:,}", f"{b:,}", f"{hl['overdue_week']:,}"])
     story.append(KeepTogether([
         Paragraph("Overdue this week", sec),
         Paragraph(
@@ -472,7 +485,8 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
     o = sum(m["open"] for m in cov.values())
     d = sum(m["dated"] for m in cov.values())
     cu = sum(m["current"] for m in cov.values())
-    rows.append(["All open", f"{o:,}", f"{d:,} ({_pct(d, o)}%)", f"{cu:,} ({_pct(cu, o)}%)"])
+    rows.append(["All open", f"{o:,}", f"{d:,} ({hl['dated_pct']}%)",
+                 f"{cu:,} ({hl['current_pct']}%)"])
     _, findings = _coverage_findings(rep)
     block = [
         Paragraph("Follow-up coverage", sec),
@@ -579,27 +593,21 @@ def build_pdf(rep: dict, out_path: str, company: str = "Horizon Renewable Power"
 # ── email ─────────────────────────────────────────────────────────────
 
 def _summary_lines(rep):
-    y, ag, prev = rep["yesterday"], rep["aged"], rep["aged_previous"]
-    c = rep["commitments"]
-    due = sum(v["Leads"] + v["Deals"] for v in c.values())
-    week = sum(v["1-3"] + v["4-7"] for v in rep["this_week"].values())
-    cur_all, findings = _coverage_findings(rep)
-    cov = rep["coverage"]
-    o = sum(m["open"] for m in cov.values())
+    y, ag, prev, hl = rep["yesterday"], rep["aged"], rep["aged_previous"], rep["headline"]
+    _, findings = _coverage_findings(rep)
     unowned_new = sum(1 for r in rep["untouched"] if r["who"] == UNASSIGNED)
     lines = [
         ("Yesterday", f"{_n(y['calls'], 'call')}, {_n(y['proposals'], 'proposal')}, "
                       f"{_n(y['deals_converted'], 'deal')} converted, "
                       f"{_n(rep['waiting'], 'lead')} still waiting"),
-        ("Due today", _n(due, "follow-up")),
-        ("Overdue this week", _n(week, "follow-up")),
-        ("Aged backlog (8+ days)", f"{ag['total']:,}"
-            + (f", {ag['by_person'].get(UNASSIGNED, 0):,} with no owner"
-               if ag["by_person"].get(UNASSIGNED) else "")
+        ("Due today", _n(hl["due_today"], "follow-up")),
+        ("Overdue this week", _n(hl["overdue_week"], "follow-up")),
+        ("Aged backlog (8+ days)", f"{hl['aged_total']:,}"
+            + (f", {hl['aged_unassigned']:,} with no owner" if hl["aged_unassigned"] else "")
             + (f"  ({_signed(ag['total'] - prev['total'])} since {prev['day']:%a %d %b})"
                if prev else "")),
-        ("Follow-up coverage", f"{_pct(sum(m['dated'] for m in cov.values()), o)}% carry a "
-                               f"date, {cur_all}% a current one"),
+        ("Follow-up coverage", f"{hl['dated_pct']}% carry a date, "
+                               f"{hl['current_pct']}% a current one"),
         ("Meetings today", f"{len(rep['diary']):,}"),
         ("Untouched new leads", f"{len(rep['untouched']):,}"
             + (f", {unowned_new:,} with no owner" if unowned_new else "")),
@@ -612,6 +620,18 @@ def _plain(markup):
                  ("&amp;", "&")):
         markup = markup.replace(a, b)
     return markup
+
+
+def whatsapp_values(rep) -> list:
+    """{{1}}..{{6}} of the crm_day_start template, read from the same payload as
+    the PDF and email — never recomputed."""
+    hl = rep["headline"]
+    return [f"{rep['today']:%a %d %b %Y}",
+            f"{hl['due_today']:,}",
+            f"{hl['overdue_week']:,}",
+            f"{hl['aged_total']:,}",
+            f"{hl['aged_unassigned']:,}",
+            f"{hl['current_pct']}%"]
 
 
 def _body_text(rep):
@@ -685,6 +705,11 @@ def send_daystart_report(now=None, sync: bool = True) -> str | None:
         "Day-start report",
         subject=f"Day Start - {rep['today']:%a %d %b %Y} | {settings.COMPANY_NAME}",
         text_body=_body_text(rep), html_body=_body_html(rep), pdf_path=pdf_path)
+
+    # The digest follows the email and only the email: with no report behind
+    # it, a WhatsApp summary is worse than silence. It never raises.
+    if sent:
+        whatsapp.send_digest("daystart", whatsapp_values(rep), stale=bool(rep["stale"]))
 
     if sync_error is not None:
         raise SyncFailed("day-start report", sync_error, bool(sent)) from sync_error

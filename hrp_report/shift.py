@@ -32,6 +32,7 @@ from reportlab.platypus import (
 import settings as config
 import settings
 from mailer import MailError, send as send_mail
+from . import whatsapp
 from .metrics import (
     CALL_COMPLETED, LOST_STAGES, WON_STAGES, SyncFailed, _dt, _link_id, load_records,
     normalise_person, snapshot_time,
@@ -958,6 +959,18 @@ def _strip_tags(markup):
     return markup.replace("<b>", "").replace("</b>", "")
 
 
+def whatsapp_values(rep) -> list:
+    """{{1}}..{{6}} of the crm_shift_evening template: the same fields the PDF's
+    headline table and backlog note print, read from the same payload."""
+    w1 = rep["windows"][0]
+    return [f"{w1['end']:%a %d %b %Y}, {w1['start']:%H:%M}–{w1['end']:%H:%M}",
+            f"{w1['calls']:,}",
+            f"{w1['proposals']:,}",
+            f"{w1['deals_converted']:,}",
+            f"{w1['leads']:,}",
+            f"{rep['ladder']['stuck']:,}"]
+
+
 def _body_text(rep):
     wins = rep["windows"]
     w1 = wins[0]
@@ -1123,6 +1136,11 @@ def send_shift_report(now=None) -> str | None:
         subject=(f"Shift Report {w1['start']:%H:%M}-{w1['end']:%H:%M} "
                  f"- {w1['end']:%d %b %Y} | {config.COMPANY_NAME}"),
         text_body=_body_text(rep), html_body=_body_html(rep), pdf_path=pdf_path)
+
+    # The digest follows the email and only the email: with no report behind
+    # it, a WhatsApp summary is worse than silence. It never raises.
+    if sent:
+        whatsapp.send_digest("shift", whatsapp_values(rep), stale=bool(_stale_for(rep)))
 
     if sync_error is not None:
         raise SyncFailed("shift report", sync_error, bool(sent)) from sync_error
